@@ -1,0 +1,19 @@
+{
+  "name": "pi-herdr-spawn",
+  "version": "1.0.0",
+  "description": "Spawn pi agents in isolated Herdr panes for parallel task execution",
+  "keywords": ["pi-package", "herdr", "agent", "spawn", "parallel", "multiplexer"],
+  "author": "duskoide",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/duskoide/pi-herdr-spawn"
+  },
+  "pi": {
+    "skills": ["./skills"],
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
