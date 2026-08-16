@@ -60,6 +60,7 @@ type WorkerDelegateArgs = {
 type WorkerHandle = {
   name: string;
   paneId: string;
+  tabId?: string;
 };
 
 type WorkerConfig = {
@@ -163,9 +164,10 @@ function validThinking(value: string): value is ThinkingLevel {
 function closeWorker(worker: WorkerHandle | undefined) {
   if (!worker) return;
   try {
-    runHerdr(["pane", "close", worker.paneId]);
+    if (worker.tabId) runHerdr(["tab", "close", worker.tabId]);
+    else runHerdr(["pane", "close", worker.paneId]);
   } catch {
-    // The pane may already have been closed by Herdr or the user.
+    // The tab or pane may already have been closed by Herdr or the user.
   }
 }
 
@@ -189,18 +191,16 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     }
     if (worker) return worker;
 
-    const current = parseJson<{ result?: { pane?: { pane_id?: string } } }>(
-      runHerdr(["pane", "current", "--current"]),
-    );
-    if (!current.result?.pane?.pane_id) throw new Error("Could not determine the current Herdr pane.");
-
-    const split = parseJson<{ result?: { pane?: { pane_id?: string } } }>(
-      runHerdr(["pane", "split", "--current", "--direction", "right", "--cwd", ctx.cwd, "--no-focus"]),
-    );
-    const paneId = split.result?.pane?.pane_id;
-    if (!paneId) throw new Error("Could not create a Herdr worker pane.");
-
     const name = `pi-worker-${Date.now().toString(36)}`;
+    const created = parseJson<{
+      result?: {
+        tab?: { tab_id?: string };
+        root_pane?: { pane_id?: string };
+      };
+    }>(runHerdr(["tab", "create", "--cwd", ctx.cwd, "--label", name, "--no-focus"]));
+    const tabId = created.result?.tab?.tab_id;
+    const paneId = created.result?.root_pane?.pane_id;
+    if (!tabId || !paneId) throw new Error("Could not create a Herdr worker tab.");
     const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
     const model = modelArgument(ctx, config.workerModel);
     if (model) startArgs.push("--model", model);
@@ -210,11 +210,11 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     try {
       await waitForShell(startArgs, paneId);
     } catch (error) {
-      closeWorker({ name, paneId });
+      closeWorker({ name, paneId, tabId });
       throw error;
     }
 
-    worker = { name, paneId };
+    worker = { name, paneId, tabId };
     applyStatus(ctx, config, worker);
     return worker;
   };

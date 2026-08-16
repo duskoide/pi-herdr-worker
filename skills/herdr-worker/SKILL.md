@@ -1,6 +1,6 @@
 ---
 name: herdr-worker
-description: Spawns a persistent pi worker in a new Herdr pane, or a temporary pi agent for isolated tasks. Switch the current session to brain mode when it should orchestrate and delegate work instead of doing it directly.
+description: Spawns a persistent pi worker in a new Herdr tab, or a temporary pi agent for isolated tasks. Switch the current session to brain mode when it should orchestrate and delegate work instead of doing it directly.
 ---
 
 # Herdr Spawn
@@ -8,7 +8,7 @@ description: Spawns a persistent pi worker in a new Herdr pane, or a temporary p
 This extension supports two session-only modes:
 
 - **regular** (default): the current pi session can inspect, edit, test, and execute work directly.
-- **brain**: the current session **changes role to the brain/orchestrator** and one persistent sibling pi is spawned as the **worker**.
+- **brain**: the current session **changes role to the brain/orchestrator** and one persistent pi is spawned in a new Herdr tab as the **worker**.
 
 ## Brain-mode workflow
 
@@ -19,10 +19,10 @@ This extension supports two session-only modes:
    - `brain-thinking <off|minimal|low|medium|high|xhigh|max>`
    - `worker-model <provider/model>`
    - `worker-thinking <off|minimal|low|medium|high|xhigh|max>`
-3. Entering brain mode switches the current session to the brain role, creates one worker pane, and keeps it alive for the session.
+3. Entering brain mode switches the current session to the brain role, creates a new worker tab, and keeps it alive for the session.
 4. In brain mode, the brain plans and delegates through `worker_delegate`. Delegations are serialized and the worker reports back after each task.
 5. The brain must not perform non-trivial mutations. Write, edit, bash, patch, delete, and move tool calls are blocked; trivial coordination is still possible through commands and status updates.
-6. Close the worker (agent + Herdr pane) when you no longer need it:
+6. Close the worker (agent + Herdr tab) when you no longer need it:
    - `worker_delegate({ prompt: "...", closeAfter: true })` closes it right after the delegated task finishes.
    - `/worker-config close` closes it on demand while staying in brain mode; the next delegation spawns a fresh worker.
    - `/worker-config mode regular` switches the session back to direct work and closes the worker. Session shutdown also performs best-effort cleanup.

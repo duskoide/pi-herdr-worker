@@ -1,6 +1,6 @@
 # pi-herdr-worker
 
-Spawn pi agents in isolated Herdr panes, or run pi as an orchestrator that delegates implementation work to one persistent worker.
+Spawn pi agents in isolated Herdr panes, or run pi as an orchestrator that delegates implementation work to one persistent worker in its own tab.
 
 ## Installation
 
@@ -21,7 +21,7 @@ Pi starts in **regular mode** for every session. Brain mode is session-only: it 
 Brain mode switches the **current session into the brain (orchestrator) role** and pairs it with one spawned worker:
 
 - **Brain** — the current pi session, after it changes role. It plans, delegates, inspects results, and reports to the user. It does not do implementation work itself.
-- **Worker** — one persistent pi instance spawned in a sibling Herdr pane. It performs implementation, testing, reviews, and other non-trivial work.
+- **Worker** — one persistent pi instance spawned in a new Herdr tab. It performs implementation, testing, reviews, and other non-trivial work.
 
 Enable and configure it with the interactive settings UI or one-line subcommands.
 
@@ -47,9 +47,9 @@ The one-line subcommands remain available (useful for scripting and quick tweaks
 /worker-config worker-thinking medium
 ```
 
-`/worker-config mode brain` changes the current session's role to brain and spawns the worker pane. Delegations reuse that worker and are serialized so tasks cannot race over the same checkout. The brain receives an explicit orchestrator system instruction and its mutation tools (`write`, `edit`, `bash`, patching, delete, and move) are blocked. Use the `worker_delegate` tool for implementation or validation tasks. The worker returns its report to the brain, which can then decide the next delegation.
+`/worker-config mode brain` changes the current session's role to brain and spawns the worker in a new Herdr tab. Delegations reuse that worker and are serialized so tasks cannot race over the same checkout. The brain receives an explicit orchestrator system instruction and its mutation tools (`write`, `edit`, `bash`, patching, delete, and move) are blocked. Use the `worker_delegate` tool for implementation or validation tasks. The worker returns its report to the brain, which can then decide the next delegation.
 
-Delegate and close the worker (agent + Herdr pane) in one step by passing `closeAfter: true`:
+Delegate and close the worker (agent + Herdr tab) in one step by passing `closeAfter: true`:
 
 ```text
 worker_delegate({ prompt: "Run the full test suite and report failures", closeAfter: true })
@@ -67,7 +67,7 @@ Return to direct work with:
 /worker-config mode regular
 ```
 
-This closes the persistent worker and its Herdr pane. The worker is also closed during session shutdown. If Pi is not running inside Herdr (`HERDR_ENV=1`), brain mode reports an error and remains disabled.
+This closes the persistent worker and its Herdr tab. The worker is also closed during session shutdown. If Pi is not running inside Herdr (`HERDR_ENV=1`), brain mode reports an error and remains disabled.
 
 ## Temporary spawn commands
 
