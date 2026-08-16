@@ -1,11 +1,21 @@
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import {
+  Container,
+  type Component,
+  SelectList,
+  type SelectItem,
+  type SettingItem,
+  SettingsList,
+  Text,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-type Mode = "regular" | "worker";
+type Mode = "regular" | "brain";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
-const THINKING_LEVELS = new Set<ThinkingLevel>([
+const THINKING_ORDER: ThinkingLevel[] = [
   "off",
   "minimal",
   "low",
@@ -13,7 +23,9 @@ const THINKING_LEVELS = new Set<ThinkingLevel>([
   "high",
   "xhigh",
   "max",
-]);
+];
+
+const THINKING_LEVELS = new Set<ThinkingLevel>(THINKING_ORDER);
 
 const MUTATING_TOOLS = new Set([
   "write",
@@ -26,13 +38,20 @@ const MUTATING_TOOLS = new Set([
 ]);
 
 const WorkerDelegateInput = Type.Object({
-  prompt: Type.String({ description: "A complete implementation, testing, or review task for the persistent worker" }),
+  prompt: Type.String({ description: "A complete implementation, testing, or review task for the spawned worker" }),
   timeout: Type.Optional(Type.Number({ description: "Worker timeout in milliseconds (default: 300000)" })),
+  closeAfter: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true, close the worker and its Herdr pane after this task completes. The next delegation spawns a fresh worker. Default: false (worker stays alive for reuse).",
+    }),
+  ),
 });
 
 type WorkerDelegateArgs = {
   prompt: string;
   timeout?: number;
+  closeAfter?: boolean;
 };
 
 type WorkerHandle = {
@@ -65,6 +84,27 @@ function runHerdr(args: string[], timeout = 30000): string {
   });
 }
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// A freshly split pane is not immediately an available shell; Herdr reports
+// agent_pane_busy until the shell reaches its interactive prompt. Retry the
+// start for a few seconds before giving up.
+async function waitForShell(startArgs: string[], paneId: string, attempts = 25, delayMs = 200): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      runHerdr(startArgs);
+      return;
+    } catch (error: any) {
+      const message = error.message ?? "";
+      if (!message.includes("agent_pane_busy") && !message.includes("not an available shell")) {
+        throw error;
+      }
+      await sleep(delayMs);
+    }
+  }
+  throw new Error(`Herdr pane ${paneId} never became an available shell.`);
+}
+
 function parseJson<T>(output: string): T {
   return JSON.parse(output) as T;
 }
@@ -82,8 +122,8 @@ function describeConfig(config: WorkerConfig, worker: WorkerHandle | undefined, 
     `worker thinking: ${config.workerThinking ?? ctx.thinkingLevel ?? "parent level"}`,
     `worker: ${worker ? `${worker.name} (${worker.paneId})` : "not running"}`,
     "",
-    "Configure with:",
-    "/worker-config mode regular|worker",
+    "Run /worker-config with no arguments to open the interactive settings UI, or use:",
+    "/worker-config mode regular|brain",
     "/worker-config brain-model <provider/model>",
     "/worker-config brain-thinking <off|minimal|low|medium|high|xhigh|max>",
     "/worker-config worker-model <provider/model>",
@@ -98,7 +138,7 @@ function notify(ctx: ExtensionContext, message: string, level: "info" | "warning
 function applyStatus(ctx: ExtensionContext, config: WorkerConfig, worker: WorkerHandle | undefined) {
   ctx.ui.setStatus(
     "herdr-worker",
-    `${config.mode === "worker" ? "WORKER" : "REGULAR"}${worker ? ` · ${worker.name}` : ""}`,
+    `${config.mode === "brain" ? "BRAIN" : "REGULAR"}${worker ? ` · ${worker.name}` : ""}`,
   );
 }
 
@@ -142,7 +182,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
 
   const startWorker = async (ctx: ExtensionContext): Promise<WorkerHandle> => {
     if (process.env.HERDR_ENV !== "1") {
-      throw new Error("Worker mode requires pi to run inside a Herdr-managed pane (HERDR_ENV=1).");
+      throw new Error("Brain mode requires pi to run inside a Herdr-managed pane (HERDR_ENV=1).");
     }
     if (worker) return worker;
 
@@ -165,7 +205,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     startArgs.push("--append-system-prompt", WORKER_SYSTEM_PROMPT);
 
     try {
-      runHerdr(startArgs);
+      await waitForShell(startArgs, paneId);
     } catch (error) {
       closeWorker({ name, paneId });
       throw error;
@@ -177,8 +217,8 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   };
 
   const delegate = async (ctx: ExtensionContext, args: WorkerDelegateArgs) => {
-    if (config.mode !== "worker") {
-      throw new Error("Worker mode is not active. Run /worker-config mode worker first.");
+    if (config.mode !== "brain") {
+      throw new Error("Brain mode is not active. Run /worker-config mode brain first.");
     }
     if (!args.prompt.trim()) throw new Error("A worker prompt is required.");
 
@@ -186,7 +226,11 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       const active = await startWorker(ctx);
       const timeout = args.timeout ?? DEFAULT_WORKER_TIMEOUT;
       runHerdr(["agent", "prompt", active.name, args.prompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
-      return runHerdr(["agent", "read", active.name, "--source", "recent-unwrapped", "--lines", "200"]);
+      const report = runHerdr(["agent", "read", active.name, "--source", "recent-unwrapped", "--lines", "200"]);
+      // Optionally tear down the worker (agent + Herdr pane) once the task is done.
+      // The next delegation will spawn a fresh worker on demand.
+      if (args.closeAfter) await stopWorker(ctx);
+      return report;
     });
     workerQueue = run.catch(() => undefined);
     return run;
@@ -201,13 +245,13 @@ export default function herdrSpawn(pi: ExtensionAPI) {
 
   const setMode = async (mode: Mode, ctx: ExtensionContext) => {
     if (mode === config.mode) {
-      if (mode === "worker") await startWorker(ctx);
+      if (mode === "brain") await startWorker(ctx);
       applyStatus(ctx, config, worker);
       return;
     }
 
-    if (mode === "worker") {
-      config.mode = "worker";
+    if (mode === "brain") {
+      config.mode = "brain";
       try {
         await startWorker(ctx);
       } catch (error: any) {
@@ -215,20 +259,238 @@ export default function herdrSpawn(pi: ExtensionAPI) {
         applyStatus(ctx, config, worker);
         throw new Error(error.message);
       }
-      notify(ctx, "Worker mode enabled. Delegate implementation and validation through worker_delegate.");
+      notify(
+        ctx,
+        "Brain mode enabled. This session is now the orchestrator (brain): plan and delegate all implementation and validation to the spawned worker with worker_delegate. Your own mutation tools are blocked.",
+      );
     } else {
       config.mode = "regular";
       await stopWorker(ctx);
-      notify(ctx, "Regular mode enabled. The current session may work directly again.");
+      notify(ctx, "Regular mode enabled. This session works directly again; the worker and its Herdr pane have been closed.");
     }
     applyStatus(ctx, config, worker);
+  };
+
+  const setBrainThinking = (level: ThinkingLevel) => {
+    pi.setThinkingLevel(level);
+    config.brainThinking = level;
+  };
+
+  // Apply a worker model/thinking change and restart the worker if it is live,
+  // so the new settings take effect on the next delegation.
+  const applyWorkerSetting = async (
+    key: "worker-model" | "worker-thinking",
+    value: string,
+    ctx: ExtensionContext,
+  ) => {
+    if (key === "worker-model") config.workerModel = value;
+    else config.workerThinking = value as ThinkingLevel;
+    if (config.mode === "brain") {
+      await stopWorker(ctx);
+      await startWorker(ctx);
+    }
+  };
+
+  // Build a SelectList submenu factory for picking a model from the registry.
+  const modelSubmenu =
+    (ctx: ExtensionContext, includeInherit: boolean) =>
+    (current: string, done: (selected?: string) => void): Component => {
+      const available = ctx.modelRegistry.getAvailable();
+      const items: SelectItem[] = [];
+      if (includeInherit) {
+        items.push({
+          value: "__inherit__",
+          label: "(inherit brain model)",
+          description: "Use the same model as the brain session",
+        });
+      }
+      for (const model of available) {
+        const id = `${model.provider}/${model.id}`;
+        items.push({ value: id, label: id, description: model.provider });
+      }
+
+      const list = new SelectList(items, Math.min(items.length, 12), getSelectListTheme());
+      const currentIndex = items.findIndex((item) => item.value === current);
+      if (currentIndex >= 0) list.setSelectedIndex(currentIndex);
+      list.onSelect = (item) => done(item.value);
+      list.onCancel = () => done(undefined);
+      return list;
+    };
+
+  // Build a SelectList submenu factory for picking a thinking level.
+  const thinkingSubmenu =
+    (includeInherit: boolean) =>
+    (current: string, done: (selected?: string) => void): Component => {
+      const items: SelectItem[] = [];
+      if (includeInherit) {
+        items.push({
+          value: "__inherit__",
+          label: "(inherit brain level)",
+          description: "Use the same thinking level as the brain session",
+        });
+      }
+      for (const level of THINKING_ORDER) items.push({ value: level, label: level });
+
+      const list = new SelectList(items, items.length, getSelectListTheme());
+      const currentIndex = items.findIndex((item) => item.value === current);
+      if (currentIndex >= 0) list.setSelectedIndex(currentIndex);
+      list.onSelect = (item) => done(item.value);
+      list.onCancel = () => done(undefined);
+      return list;
+    };
+
+  const openSettingsUI = async (ctx: ExtensionContext) => {
+    const brainModelValue = () => config.brainModel ?? currentModelId(ctx) ?? "current";
+    const brainThinkingValue = () => config.brainThinking ?? ctx.thinkingLevel ?? "current";
+    const workerModelValue = () => config.workerModel ?? "__inherit__";
+    const workerThinkingValue = () => config.workerThinking ?? "__inherit__";
+    const displayWorkerModel = () => config.workerModel ?? "(inherit brain model)";
+    const displayWorkerThinking = () => config.workerThinking ?? "(inherit brain level)";
+
+    await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+      const container = new Container();
+      container.addChild(new Text(theme.fg("accent", theme.bold("Herdr Worker Settings")), 1, 1));
+
+      const items: SettingItem[] = [
+        {
+          id: "mode",
+          label: "Mode",
+          description: "regular = work directly; brain = orchestrate a spawned worker",
+          currentValue: config.mode,
+          values: ["regular", "brain"],
+        },
+        {
+          id: "brain-model",
+          label: "Brain model",
+          description: "Model for this orchestrator session (enter to pick)",
+          currentValue: brainModelValue(),
+          submenu: modelSubmenu(ctx, false),
+        },
+        {
+          id: "brain-thinking",
+          label: "Brain thinking",
+          description: "Thinking level for this orchestrator session",
+          currentValue: brainThinkingValue(),
+          submenu: thinkingSubmenu(false),
+        },
+        {
+          id: "worker-model",
+          label: "Worker model",
+          description: "Model used by the spawned worker (enter to pick)",
+          currentValue: displayWorkerModel(),
+          submenu: modelSubmenu(ctx, true),
+        },
+        {
+          id: "worker-thinking",
+          label: "Worker thinking",
+          description: "Thinking level used by the spawned worker",
+          currentValue: displayWorkerThinking(),
+          submenu: thinkingSubmenu(true),
+        },
+        {
+          id: "worker",
+          label: "Worker process",
+          description: "Close the running worker (a new one spawns on next delegation)",
+          currentValue: worker ? `${worker.name} (running)` : "not running",
+          values: worker ? ["running", "close"] : ["not running"],
+        },
+        {
+          id: "reset",
+          label: "Reset overrides",
+          description: "Clear brain/worker model and thinking overrides",
+          currentValue: "press enter",
+          values: ["press enter", "reset"],
+        },
+      ];
+
+      const settingsList = new SettingsList(
+        items,
+        Math.min(items.length + 2, 15),
+        getSettingsListTheme(),
+        (id, newValue) => {
+          void (async () => {
+            try {
+              if (id === "mode") {
+                if (newValue === "regular" || newValue === "brain") await setMode(newValue, ctx);
+                settingsList.updateValue("mode", config.mode);
+                settingsList.updateValue("worker", worker ? `${worker.name} (running)` : "not running");
+              } else if (id === "brain-model") {
+                await setBrainModel(newValue, ctx);
+                settingsList.updateValue("brain-model", brainModelValue());
+              } else if (id === "brain-thinking") {
+                if (validThinking(newValue)) setBrainThinking(newValue);
+                settingsList.updateValue("brain-thinking", brainThinkingValue());
+              } else if (id === "worker-model") {
+                if (newValue === "__inherit__") {
+                  config.workerModel = undefined;
+                  if (config.mode === "brain") {
+                    await stopWorker(ctx);
+                    await startWorker(ctx);
+                  }
+                } else {
+                  await applyWorkerSetting("worker-model", newValue, ctx);
+                }
+                settingsList.updateValue("worker-model", displayWorkerModel());
+              } else if (id === "worker-thinking") {
+                if (newValue === "__inherit__") {
+                  config.workerThinking = undefined;
+                  if (config.mode === "brain") {
+                    await stopWorker(ctx);
+                    await startWorker(ctx);
+                  }
+                } else if (validThinking(newValue)) {
+                  await applyWorkerSetting("worker-thinking", newValue, ctx);
+                }
+                settingsList.updateValue("worker-thinking", displayWorkerThinking());
+              } else if (id === "worker") {
+                if (newValue === "close" && worker) {
+                  await stopWorker(ctx);
+                }
+                settingsList.updateValue("worker", worker ? `${worker.name} (running)` : "not running");
+              } else if (id === "reset") {
+                if (newValue === "reset") {
+                  config.brainModel = undefined;
+                  config.brainThinking = undefined;
+                  config.workerModel = undefined;
+                  config.workerThinking = undefined;
+                  settingsList.updateValue("brain-model", brainModelValue());
+                  settingsList.updateValue("brain-thinking", brainThinkingValue());
+                  settingsList.updateValue("worker-model", displayWorkerModel());
+                  settingsList.updateValue("worker-thinking", displayWorkerThinking());
+                }
+                settingsList.updateValue("reset", "press enter");
+              }
+              applyStatus(ctx, config, worker);
+            } catch (error: any) {
+              notify(ctx, error.message, "error");
+            } finally {
+              tui.requestRender();
+            }
+          })();
+        },
+        () => done(undefined),
+      );
+      container.addChild(settingsList);
+      container.addChild(
+        new Text(theme.fg("dim", "↑↓ navigate · enter cycle/open · esc close"), 1, 0),
+      );
+
+      return {
+        render: (w) => container.render(w),
+        invalidate: () => container.invalidate(),
+        handleInput: (data) => {
+          settingsList.handleInput?.(data);
+          tui.requestRender();
+        },
+      };
+    });
   };
 
   pi.on("session_start", async (_event, ctx) => {
     config.mode = "regular";
     worker = undefined;
     applyStatus(ctx, config, worker);
-    notify(ctx, "Herdr spawn ready in regular mode. Use /worker-config to configure or enter worker mode.");
+    notify(ctx, "Herdr worker ready in regular mode. Use /worker-config mode brain to make this session the orchestrator.");
   });
 
   pi.on("session_shutdown", async () => {
@@ -237,26 +499,31 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
-    if (config.mode !== "worker") return;
+    if (config.mode !== "brain") return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\nWORKER MODE (ORCHESTRATOR): You are the brain and must exclusively orchestrate. Do not use write, edit, bash, apply_patch, patch, delete, or move tools. Delegate implementation, testing, and other non-trivial work with worker_delegate, then inspect and summarize the worker result. Keep delegation prompts complete and specific.`,
+      systemPrompt: `${event.systemPrompt}\n\nBRAIN MODE (ORCHESTRATOR): This session has switched roles and is now the brain. You must exclusively orchestrate and delegate; you do not do implementation work yourself. Do not use write, edit, bash, apply_patch, patch, delete, or move tools. Delegate all implementation, testing, and other non-trivial work to the spawned worker with worker_delegate, then inspect and summarize the worker's report. Keep delegation prompts complete and specific.`,
     };
   });
 
   pi.on("tool_call", async (event) => {
-    if (config.mode === "worker" && MUTATING_TOOLS.has(event.toolName)) {
+    if (config.mode === "brain" && MUTATING_TOOLS.has(event.toolName)) {
       return {
         block: true,
-        reason: `Blocked in worker mode: ${event.toolName} is a mutation tool. Use worker_delegate for non-trivial work.`,
+        reason: `Blocked in brain mode: ${event.toolName} is a mutation tool. You are the orchestrator — delegate this work to the worker with worker_delegate.`,
       };
     }
   });
 
   pi.registerCommand("worker-config", {
-    description: "Configure regular/worker mode, brain and worker models, and thinking levels",
+    description: "Open the worker settings UI, or configure it via subcommands (mode, brain-model, worker-model, thinking, close, reset)",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
-      if (tokens.length === 0 || tokens[0] === "show") {
+      // No arguments opens the interactive settings UI.
+      if (tokens.length === 0) {
+        await openSettingsUI(ctx);
+        return;
+      }
+      if (tokens[0] === "show") {
         notify(ctx, describeConfig(config, worker, ctx));
         return;
       }
@@ -264,29 +531,34 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       const key = tokens[0]!.toLowerCase();
       const value = tokens.slice(1).join(" ");
       try {
-        if (key === "mode") {
-          if (value !== "regular" && value !== "worker") throw new Error("Usage: /worker-config mode regular|worker");
+        if (key === "ui") {
+          await openSettingsUI(ctx);
+          return;
+        } else if (key === "mode") {
+          if (value !== "regular" && value !== "brain") throw new Error("Usage: /worker-config mode regular|brain");
           await setMode(value, ctx);
+        } else if (key === "close" || key === "stop-worker") {
+          if (!worker) {
+            notify(ctx, "No worker is running.");
+          } else {
+            const name = worker.name;
+            await stopWorker(ctx);
+            notify(ctx, `Closed worker ${name} and its Herdr pane. Mode remains ${config.mode}; a new worker spawns on the next delegation.`);
+          }
         } else if (key === "brain-model") {
           if (!value) throw new Error("Usage: /worker-config brain-model <provider/model>");
           await setBrainModel(value, ctx);
           notify(ctx, `Brain model set to ${config.brainModel}.`);
         } else if (key === "brain-thinking") {
           if (!validThinking(value)) throw new Error("Usage: /worker-config brain-thinking <off|minimal|low|medium|high|xhigh|max>");
-          pi.setThinkingLevel(value);
-          config.brainThinking = value;
+          setBrainThinking(value);
           notify(ctx, `Brain thinking level set to ${value}.`);
         } else if (key === "worker-model" || key === "worker-thinking") {
           if (key === "worker-thinking" && !validThinking(value)) {
             throw new Error("Usage: /worker-config worker-thinking <off|minimal|low|medium|high|xhigh|max>");
           }
           if (!value) throw new Error(`Usage: /worker-config ${key} <value>`);
-          if (key === "worker-model") config.workerModel = value;
-          else config.workerThinking = value as ThinkingLevel;
-          if (config.mode === "worker") {
-            await stopWorker(ctx);
-            await startWorker(ctx);
-          }
+          await applyWorkerSetting(key, value, ctx);
           notify(ctx, `${key} set to ${value}.`);
         } else if (key === "reset") {
           config.brainModel = undefined;
@@ -295,7 +567,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
           config.workerThinking = undefined;
           notify(ctx, "Worker configuration reset. Mode remains unchanged.");
         } else {
-          throw new Error("Usage: /worker-config [show|mode|brain-model|brain-thinking|worker-model|worker-thinking|reset] ...");
+          throw new Error("Usage: /worker-config [ui|show|mode|close|brain-model|brain-thinking|worker-model|worker-thinking|reset] ... (run with no arguments to open the settings UI)");
         }
         applyStatus(ctx, config, worker);
       } catch (error: any) {
@@ -307,7 +579,8 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   pi.registerTool({
     name: "worker_delegate",
     label: "Worker Delegate",
-    description: "Delegate implementation, testing, review, or other non-trivial work to the persistent Herdr worker. Available for use in worker mode.",
+    description:
+      "Delegate implementation, testing, review, or other non-trivial work to the spawned Herdr worker. Use this in brain mode: this session is the orchestrator and does not do the work itself. The worker persists across delegations by default; pass closeAfter: true to close the worker and its Herdr pane once the task completes.",
     parameters: WorkerDelegateInput,
     async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
       try {
@@ -444,7 +717,7 @@ async function runOneShot(prompt: string, name: string, model: string | undefine
     if (!paneId) throw new Error("Could not create new pane");
     const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
     if (model) startArgs.push("--model", model);
-    runHerdr(startArgs);
+    await waitForShell(startArgs, paneId);
     runHerdr(["agent", "prompt", name, prompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
     const response = runHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "100"]);
     return `Agent ${name} completed in pane ${paneId}\n\n${response}`;

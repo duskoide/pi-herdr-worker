@@ -1,6 +1,6 @@
 ---
 name: herdr-worker
-description: Spawns a persistent pi worker in a new Herdr pane, or a temporary pi agent for isolated tasks. Use worker mode when the current session should remain an orchestrator.
+description: Spawns a persistent pi worker in a new Herdr pane, or a temporary pi agent for isolated tasks. Switch the current session to brain mode when it should orchestrate and delegate work instead of doing it directly.
 ---
 
 # Herdr Spawn
@@ -8,23 +8,26 @@ description: Spawns a persistent pi worker in a new Herdr pane, or a temporary p
 This extension supports two session-only modes:
 
 - **regular** (default): the current pi session can inspect, edit, test, and execute work directly.
-- **worker**: the current session is the **brain/orchestrator** and one persistent sibling pi is the **worker**.
+- **brain**: the current session **changes role to the brain/orchestrator** and one persistent sibling pi is spawned as the **worker**.
 
-## Worker-mode workflow
+## Brain-mode workflow
 
 1. Start Pi. The extension initializes in regular mode.
 2. Configure the roles with `/worker-config`:
-   - `mode regular|worker`
+   - `mode regular|brain`
    - `brain-model <provider/model>`
    - `brain-thinking <off|minimal|low|medium|high|xhigh|max>`
    - `worker-model <provider/model>`
    - `worker-thinking <off|minimal|low|medium|high|xhigh|max>`
-3. Entering worker mode creates one worker pane and keeps it alive for the session.
-4. In worker mode, the brain plans and delegates through `worker_delegate`. Delegations are serialized and the worker reports back after each task.
+3. Entering brain mode switches the current session to the brain role, creates one worker pane, and keeps it alive for the session.
+4. In brain mode, the brain plans and delegates through `worker_delegate`. Delegations are serialized and the worker reports back after each task.
 5. The brain must not perform non-trivial mutations. Write, edit, bash, patch, delete, and move tool calls are blocked; trivial coordination is still possible through commands and status updates.
-6. `/worker-config mode regular` stops and cleans up the worker. Session shutdown also performs best-effort cleanup.
+6. Close the worker (agent + Herdr pane) when you no longer need it:
+   - `worker_delegate({ prompt: "...", closeAfter: true })` closes it right after the delegated task finishes.
+   - `/worker-config close` closes it on demand while staying in brain mode; the next delegation spawns a fresh worker.
+   - `/worker-config mode regular` switches the session back to direct work and closes the worker. Session shutdown also performs best-effort cleanup.
 
-Worker mode requires `HERDR_ENV=1`. Model choices are applied when the worker starts; changing the worker model or thinking level while active restarts the worker so the new settings take effect. Brain model and thinking settings apply to the current pi session.
+Brain mode requires `HERDR_ENV=1`. Model choices are applied when the worker starts; changing the worker model or thinking level while active restarts the worker so the new settings take effect. Brain model and thinking settings apply to the current pi session.
 
 ## Delegating a task
 

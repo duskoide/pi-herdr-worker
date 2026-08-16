@@ -1,21 +1,28 @@
 # Herdr Worker Skill
 
-Run pi agents in isolated Herdr panes, including the persistent worker used by worker mode.
+Run pi agents in isolated Herdr panes, including the persistent worker used by brain mode.
 
 ## Quick Start
 
-After installing this package with `pi install npm:pi-herdr-worker`, Pi starts in regular mode. Configure the session-only worker workflow with:
+After installing this package with `pi install npm:pi-herdr-worker`, Pi starts in regular mode. Configure the session-only brain/worker workflow with:
 
 ```text
 /worker-config show
-/worker-config mode worker
+/worker-config mode brain
 /worker-config brain-model <provider/model>
 /worker-config brain-thinking <level>
 /worker-config worker-model <provider/model>
 /worker-config worker-thinking <level>
 ```
 
-In worker mode, the current session is the brain/orchestrator and delegates implementation, testing, and review work through `worker_delegate`. One worker pi stays in a sibling pane and receives serialized tasks. The brain's mutation tools are blocked in this mode.
+In brain mode, the current session **changes role to the brain/orchestrator** and delegates implementation, testing, and review work through `worker_delegate`. One worker pi is spawned in a sibling pane and receives serialized tasks. The brain's mutation tools are blocked in this mode.
+
+Close the worker (agent + Herdr pane) when you're done with it:
+
+```text
+worker_delegate({ prompt: "Run tests and report failures", closeAfter: true })
+/worker-config close
+```
 
 Return to direct work with:
 
