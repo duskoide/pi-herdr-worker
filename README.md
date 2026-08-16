@@ -28,7 +28,7 @@ Enable and configure it with the interactive settings UI or one-line subcommands
 Run `/worker-config` with no arguments to open the settings UI — an interactive panel where you can:
 
 - Toggle **Mode** between `regular` and `brain` (Enter cycles).
-- Pick the **Brain model** and **Worker model** from a searchable list of available models (Enter opens a picker; the worker model can inherit the brain model).
+- Pick the **Brain model** and **Worker model** from a searchable list of available models (Enter opens the picker; start typing to filter by name, backspace to edit; the worker model can inherit the brain model).
 - Set the **Brain thinking** and **Worker thinking** levels from a picker.
 - **Reset overrides** back to inheriting the current session's model/thinking.
 

@@ -11,6 +11,7 @@ import {
   type SettingItem,
   SettingsList,
   Text,
+  truncateToWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -293,6 +294,70 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     }
   };
 
+  // A SelectList wrapped with a live search box. Typing filters items by
+  // substring (case-insensitive) against the label; backspace edits the query.
+  // Navigation/confirm/cancel keys pass through to the underlying list.
+  const searchableSelect = (
+    allItems: SelectItem[],
+    current: string,
+    done: (selected?: string) => void,
+  ): Component => {
+    let query = "";
+    const theme = getSelectListTheme();
+
+    const filtered = (): SelectItem[] => {
+      if (!query) return allItems;
+      const needle = query.toLowerCase();
+      return allItems.filter(
+        (item) =>
+          item.label.toLowerCase().includes(needle) ||
+          item.value.toLowerCase().includes(needle),
+      );
+    };
+
+    let list = new SelectList(allItems, Math.min(allItems.length, 12), theme);
+    const preselect = allItems.findIndex((item) => item.value === current);
+    if (preselect >= 0) list.setSelectedIndex(preselect);
+    list.onSelect = (item) => done(item.value);
+    list.onCancel = () => done(undefined);
+
+    const rebuild = () => {
+      const items = filtered();
+      list = new SelectList(items, Math.min(Math.max(items.length, 1), 12), theme);
+      list.onSelect = (item) => done(item.value);
+      list.onCancel = () => done(undefined);
+    };
+
+    return {
+      render(width: number): string[] {
+        const label = query.length ? query : "(type to search)";
+        const searchLine = truncateToWidth(`  🔍 ${label}`, width);
+        return [searchLine, ...list.render(width)];
+      },
+      invalidate() {
+        list.invalidate();
+      },
+      handleInput(data: string) {
+        // Backspace edits the query.
+        if (matchesKey(data, Key.backspace)) {
+          if (query.length) {
+            query = query.slice(0, -1);
+            rebuild();
+          }
+          return;
+        }
+        // Printable single characters extend the query. Navigation, enter, and
+        // escape (multi-byte or control sequences) fall through to the list.
+        if (data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) !== 127) {
+          query += data;
+          rebuild();
+          return;
+        }
+        list.handleInput(data);
+      },
+    };
+  };
+
   // Build a SelectList submenu factory for picking a model from the registry.
   const modelSubmenu =
     (ctx: ExtensionContext, includeInherit: boolean) =>
@@ -311,12 +376,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
         items.push({ value: id, label: id, description: model.provider });
       }
 
-      const list = new SelectList(items, Math.min(items.length, 12), getSelectListTheme());
-      const currentIndex = items.findIndex((item) => item.value === current);
-      if (currentIndex >= 0) list.setSelectedIndex(currentIndex);
-      list.onSelect = (item) => done(item.value);
-      list.onCancel = () => done(undefined);
-      return list;
+      return searchableSelect(items, current, done);
     };
 
   // Build a SelectList submenu factory for picking a thinking level.
