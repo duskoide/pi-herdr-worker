@@ -22,16 +22,28 @@ PROMPT="${2:?Usage: herdr-spawn.sh <agent-name> <prompt> [--model <model>] [--ti
 
 # Parse optional arguments
 MODEL=""
+THINKING=""
 TIMEOUT="120000"
 shift 2 || true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --model)
+      [[ $# -ge 2 ]] || { echo "Error: --model requires a value" >&2; exit 1; }
       MODEL="$2"
       shift 2
       ;;
+    --thinking)
+      [[ $# -ge 2 ]] || { echo "Error: --thinking requires a value" >&2; exit 1; }
+      THINKING="$2"
+      case "$THINKING" in
+        off|minimal|low|medium|high|xhigh|max) ;;
+        *) echo "Error: invalid thinking level: $THINKING" >&2; exit 1 ;;
+      esac
+      shift 2
+      ;;
     --timeout)
+      [[ $# -ge 2 ]] || { echo "Error: --timeout requires a value" >&2; exit 1; }
       TIMEOUT="$2"
       shift 2
       ;;
@@ -66,13 +78,17 @@ if [[ -z "$NEW_PANE_ID" ]]; then
   exit 1
 fi
 
-# Start pi agent (with optional model)
-START_CMD="herdr agent start \"$AGENT_NAME\" --kind pi --pane \"$NEW_PANE_ID\""
+# Start pi agent (with optional model and thinking level).
+# Use an array so model names cannot be interpreted as shell syntax.
+START_ARGS=(agent start "$AGENT_NAME" --kind pi --pane "$NEW_PANE_ID" --)
 if [[ -n "$MODEL" ]]; then
-  START_CMD="$START_CMD -- --model \"$MODEL\""
+  START_ARGS+=(--model "$MODEL")
+fi
+if [[ -n "$THINKING" ]]; then
+  START_ARGS+=(--thinking "$THINKING")
 fi
 
-START_RESULT=$(eval "$START_CMD")
+START_RESULT=$(herdr "${START_ARGS[@]}")
 AGENT_STATUS=$(echo "$START_RESULT" | jq -r '.result.agent.agent_status')
 
 if [[ "$AGENT_STATUS" == "unknown" ]]; then
@@ -98,6 +114,7 @@ cat <<EOF
   "pane_id": "$NEW_PANE_ID",
   "agent_name": "$AGENT_NAME",
   "model": "${MODEL:-parent}",
+  "thinking": "${THINKING:-parent}",
   "status": "completed",
   "response": $(echo "$RESPONSE" | jq -Rs .)
 }

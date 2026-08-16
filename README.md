@@ -1,6 +1,6 @@
 # pi-herdr-spawn
 
-Spawn pi agents in isolated Herdr panes to execute tasks in parallel.
+Spawn pi agents in isolated Herdr panes, or run pi as an orchestrator that delegates implementation work to one persistent worker.
 
 ## Installation
 
@@ -14,37 +14,51 @@ Or via git:
 pi install git:github.com/duskoide/pi-herdr-spawn
 ```
 
-## Usage
+Pi starts in **regular mode** for every session. Worker mode is session-only: it never persists across restarts, reloads, or session switches.
 
-### Slash Commands
+## Worker mode
 
-After installing, restart pi or run `/reload`:
+Worker mode separates the current session into two roles:
 
-```bash
-# Basic usage - spawn with auto-generated name
+- **Brain** — the current pi session. It plans, delegates, inspects results, and reports to the user.
+- **Worker** — one persistent pi instance in a sibling Herdr pane. It performs implementation, testing, reviews, and other non-trivial work.
+
+Enable and configure it with one command:
+
+```text
+/worker-config show
+/worker-config mode worker
+/worker-config brain-model anthropic/claude-sonnet-4-5
+/worker-config brain-thinking high
+/worker-config worker-model openai/gpt-4o
+/worker-config worker-thinking medium
+```
+
+`/worker-config mode worker` creates the worker pane. Delegations reuse that worker and are serialized so tasks cannot race over the same checkout. The brain receives an explicit orchestrator system instruction and mutation tools (`write`, `edit`, `bash`, patching, delete, and move) are blocked. Use the `worker_delegate` tool for implementation or validation tasks. The worker returns its report to the brain, which can then decide the next delegation.
+
+Return to direct work with:
+
+```text
+/worker-config mode regular
+```
+
+This closes the persistent worker. The worker is also closed during session shutdown. If Pi is not running inside Herdr (`HERDR_ENV=1`), worker mode reports an error and remains disabled.
+
+## Temporary spawn commands
+
+These commands remain available in both modes for short-lived, independent tasks:
+
+```text
 /spawn Run tests and report failures
-
-# With custom name
-/spawn Review code pi-reviewer
-
-# With custom name and model
 /spawn Review code pi-reviewer claude-sonnet-5
-
-# Quick spawn (shorthand)
 /spawnp Run the linter and fix errors
-
-# List running agents
 /spawnlist
-
-# Kill a specific agent
 /spawnkill pi-test-runner
 ```
 
-### Tool Usage
+`spawn_pi` is also available as a tool:
 
-You can also use the `spawn_pi` tool directly:
-
-```
+```text
 spawn_pi({
   prompt: "Run tests and report any failures",
   name: "pi-test-runner",
@@ -54,52 +68,27 @@ spawn_pi({
 })
 ```
 
-### Command Line
+## Command line helper
 
 ```bash
-~/.pi/agent/bin/herdr-spawn.sh <agent-name> "<prompt>" [--model <model>] [--timeout <ms>]
+~/.pi/agent/bin/herdr-spawn.sh <agent-name> "<prompt>" [--model <model>] [--thinking <level>] [--timeout <ms>]
 
-# Example:
-~/.pi/agent/bin/herdr-spawn.sh pi-test "Run npm test and report results" --timeout 180000
+~/.pi/agent/bin/herdr-spawn.sh pi-test "Run npm test and report results" \
+  --model openai/gpt-4o --thinking medium --timeout 180000
 ```
-
-## How It Works
-
-1. **Creates a new pane** - Splits the current pane to create an isolated terminal
-2. **Starts pi agent** - Launches a fresh pi instance in the new pane
-3. **Sends your prompt** - Submits the task and waits for completion
-4. **Reads the response** - Gets the agent's output
-5. **Cleans up** - Closes the pane and stops the agent automatically
 
 ## Requirements
 
 - Pi must be running inside a Herdr-managed pane (`HERDR_ENV=1`)
 - Herdr must be installed and running
+- The requested models must be available and authenticated in Pi
 
-## Use Cases
+## How temporary spawning works
 
-### Parallel Testing
-
-```bash
-/spawn npm test pi-tests
-/spawn npm run lint pi-linter
-/spawn npm run typecheck pi-types
-```
-
-### Code Review
-
-```
-spawn_pi({ prompt: "Review the recent git changes and suggest improvements" })
-```
-
-### Long-Running Tasks
-
-```
-spawn_pi({ 
-  prompt: "Run the build process and report any errors",
-  timeout: 300000 
-})
-```
+1. Split the current pane without taking focus.
+2. Start a fresh pi agent with the requested model/thinking settings.
+3. Send the prompt and wait for its response.
+4. Read the response and close the temporary pane.
 
 ## License
 
