@@ -97,7 +97,7 @@ function notify(ctx: ExtensionContext, message: string, level: "info" | "warning
 
 function applyStatus(ctx: ExtensionContext, config: WorkerConfig, worker: WorkerHandle | undefined) {
   ctx.ui.setStatus(
-    "herdr-spawn",
+    "herdr-worker",
     `${config.mode === "worker" ? "WORKER" : "REGULAR"}${worker ? ` · ${worker.name}` : ""}`,
   );
 }

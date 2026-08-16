@@ -1,17 +1,17 @@
-# pi-herdr-spawn
+# pi-herdr-worker
 
 Spawn pi agents in isolated Herdr panes, or run pi as an orchestrator that delegates implementation work to one persistent worker.
 
 ## Installation
 
 ```bash
-pi install npm:pi-herdr-spawn
+pi install npm:pi-herdr-worker
 ```
 
 Or via git:
 
 ```bash
-pi install git:github.com/duskoide/pi-herdr-spawn
+pi install git:github.com/duskoide/pi-herdr-worker
 ```
 
 Pi starts in **regular mode** for every session. Worker mode is session-only: it never persists across restarts, reloads, or session switches.
@@ -71,9 +71,9 @@ spawn_pi({
 ## Command line helper
 
 ```bash
-~/.pi/agent/bin/herdr-spawn.sh <agent-name> "<prompt>" [--model <model>] [--thinking <level>] [--timeout <ms>]
+~/.pi/agent/bin/herdr-worker.sh <agent-name> "<prompt>" [--model <model>] [--thinking <level>] [--timeout <ms>]
 
-~/.pi/agent/bin/herdr-spawn.sh pi-test "Run npm test and report results" \
+~/.pi/agent/bin/herdr-worker.sh pi-test "Run npm test and report results" \
   --model openai/gpt-4o --thinking medium --timeout 180000
 ```
 

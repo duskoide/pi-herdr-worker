@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# herdr-spawn.sh - Spawn a pi agent in a new Herdr pane
+# herdr-worker.sh - Spawn a pi agent in a new Herdr pane
 #
-# Usage: herdr-spawn.sh <agent-name> <prompt> [--model <model>] [--timeout <ms>]
+# Usage: herdr-worker.sh <agent-name> <prompt> [--model <model>] [--thinking <level>] [--timeout <ms>]
 #
 # Example:
-#   herdr-spawn.sh pi-test "Run tests and report results"
-#   herdr-spawn.sh pi-reviewer "Review the code changes" --model gpt-4o
-#   herdr-spawn.sh pi-builder "Build project" --model claude-sonnet-5 --timeout 180000
+#   herdr-worker.sh pi-test "Run tests and report results"
+#   herdr-worker.sh pi-reviewer "Review the code changes" --model gpt-4o
+#   herdr-worker.sh pi-builder "Build project" --model claude-sonnet-5 --timeout 180000
 
 set -euo pipefail
 
@@ -17,8 +17,8 @@ if [[ "${HERDR_ENV:-}" != "1" ]]; then
 fi
 
 # Parse required arguments
-AGENT_NAME="${1:?Usage: herdr-spawn.sh <agent-name> <prompt> [--model <model>] [--timeout <ms>]}"
-PROMPT="${2:?Usage: herdr-spawn.sh <agent-name> <prompt> [--model <model>] [--timeout <ms>]}"
+AGENT_NAME="${1:?Usage: herdr-worker.sh <agent-name> <prompt> [--model <model>] [--thinking <level>] [--timeout <ms>]}"
+PROMPT="${2:?Usage: herdr-worker.sh <agent-name> <prompt> [--model <model>] [--thinking <level>] [--timeout <ms>]}"
 
 # Parse optional arguments
 MODEL=""

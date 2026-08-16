@@ -1,5 +1,5 @@
 ---
-name: herdr-spawn
+name: herdr-worker
 description: Spawns a persistent pi worker in a new Herdr pane, or a temporary pi agent for isolated tasks. Use worker mode when the current session should remain an orchestrator.
 ---
 
@@ -33,7 +33,7 @@ Use the `worker_delegate` tool with a complete task, including the relevant file
 Example delegation:
 
 ```text
-Implement the worker-mode configuration command in extensions/herdr-spawn.ts.
+Implement the worker-mode configuration command in extensions/herdr-worker.ts.
 Preserve the existing temporary /spawn commands. Run the strongest available
 TypeScript or Pi extension smoke check and report changed files and failures.
 ```
@@ -45,7 +45,7 @@ The extension also keeps `/spawn`, `/spawnp`, `/spawnlist`, `/spawnkill`, and `s
 Temporary agents can receive a model and thinking level from the command-line helper:
 
 ```bash
-~/.pi/agent/bin/herdr-spawn.sh <agent-name> "<prompt>" \
+~/.pi/agent/bin/herdr-worker.sh <agent-name> "<prompt>" \
   [--model <provider/model>] [--thinking <level>] [--timeout <ms>]
 ```
 
