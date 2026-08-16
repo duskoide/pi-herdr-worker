@@ -140,10 +140,16 @@ function notify(ctx: ExtensionContext, message: string, level: "info" | "warning
 }
 
 function applyStatus(ctx: ExtensionContext, config: WorkerConfig, worker: WorkerHandle | undefined) {
-  ctx.ui.setStatus(
-    "herdr-worker",
-    `${config.mode === "brain" ? "BRAIN" : "REGULAR"}${worker ? ` · ${worker.name}` : ""}`,
-  );
+  const theme = ctx.ui.theme;
+  const isBrain = config.mode === "brain";
+  const label = theme.fg("muted", "working mode:");
+  const mode = isBrain
+    ? theme.fg("accent", theme.bold("brain"))
+    : theme.fg("success", theme.bold("regular"));
+  const workerTag = worker
+    ? ` ${theme.fg("muted", "·")} ${theme.fg("warning", "●")} ${theme.fg("muted", worker.name)}`
+    : "";
+  ctx.ui.setStatus("herdr-worker", `${label} ${mode}${workerTag}`);
 }
 
 function findModel(ctx: ExtensionContext, requested: string) {
