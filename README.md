@@ -30,12 +30,11 @@ Run `/worker-config` with no arguments to open the settings UI — an interactiv
 - Toggle **Mode** between `regular` and `brain` (Enter cycles).
 - Pick the **Brain model** and **Worker model** from a searchable list of available models (Enter opens a picker; the worker model can inherit the brain model).
 - Set the **Brain thinking** and **Worker thinking** levels from a picker.
-- Close the running **Worker process** (a fresh one spawns on the next delegation).
 - **Reset overrides** back to inheriting the current session's model/thinking.
 
-Changes apply immediately as you make them. Use ↑↓ to navigate, Enter to cycle or open a picker, and Esc to close.
+The panel edits a **draft** — nothing is applied while you navigate. A status line shows `● unsaved changes` once you edit anything. Press **Ctrl+S** to save: the extension then switches the session model/mode and, if needed, reloads the worker with the new settings. Press **Esc** to discard the draft and close without changes. Use ↑↓ to navigate and Enter to cycle or open a picker.
 
-The one-line subcommands remain available (useful for scripting and quick tweaks):
+The one-line subcommands remain available (useful for scripting and quick tweaks; these apply immediately):
 
 ```text
 /worker-config              # open the settings UI

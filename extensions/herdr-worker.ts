@@ -4,6 +4,8 @@ import { getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-cod
 import {
   Container,
   type Component,
+  Key,
+  matchesKey,
   SelectList,
   type SelectItem,
   type SettingItem,
@@ -340,145 +342,194 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     };
 
   const openSettingsUI = async (ctx: ExtensionContext) => {
-    const brainModelValue = () => config.brainModel ?? currentModelId(ctx) ?? "current";
-    const brainThinkingValue = () => config.brainThinking ?? ctx.thinkingLevel ?? "current";
-    const workerModelValue = () => config.workerModel ?? "__inherit__";
-    const workerThinkingValue = () => config.workerThinking ?? "__inherit__";
-    const displayWorkerModel = () => config.workerModel ?? "(inherit brain model)";
-    const displayWorkerThinking = () => config.workerThinking ?? "(inherit brain level)";
+    // Draft state: edits are collected here and only applied to the live config
+    // (and the worker) when the user presses Ctrl+S. Esc discards the draft.
+    type Draft = {
+      mode: Mode;
+      brainModel?: string;
+      brainThinking?: ThinkingLevel;
+      workerModel?: string;
+      workerThinking?: ThinkingLevel;
+    };
+    const draft: Draft = {
+      mode: config.mode,
+      brainModel: config.brainModel,
+      brainThinking: config.brainThinking,
+      workerModel: config.workerModel,
+      workerThinking: config.workerThinking,
+    };
+
+    const brainModelDisplay = () => draft.brainModel ?? currentModelId(ctx) ?? "current";
+    const brainThinkingDisplay = () => draft.brainThinking ?? ctx.thinkingLevel ?? "current";
+    const workerModelDisplay = () => draft.workerModel ?? "(inherit brain model)";
+    const workerThinkingDisplay = () => draft.workerThinking ?? "(inherit brain level)";
+
+    const isDirty = () =>
+      draft.mode !== config.mode ||
+      draft.brainModel !== config.brainModel ||
+      draft.brainThinking !== config.brainThinking ||
+      draft.workerModel !== config.workerModel ||
+      draft.workerThinking !== config.workerThinking;
+
+    // Apply the draft to the live config and reconcile the worker/model/thinking.
+    const saveDraft = async () => {
+      // Brain model: authenticate and switch the current session's model.
+      if (draft.brainModel !== config.brainModel && draft.brainModel) {
+        await setBrainModel(draft.brainModel, ctx);
+      }
+      // Brain thinking level applies to this session.
+      if (draft.brainThinking !== config.brainThinking && draft.brainThinking) {
+        setBrainThinking(draft.brainThinking);
+      }
+
+      // Worker model/thinking only change stored config here; the worker is
+      // restarted once below if anything worker-affecting changed.
+      const workerChanged =
+        draft.workerModel !== config.workerModel || draft.workerThinking !== config.workerThinking;
+      config.workerModel = draft.workerModel;
+      config.workerThinking = draft.workerThinking;
+
+      // Mode change spawns or tears down the worker as needed.
+      if (draft.mode !== config.mode) {
+        await setMode(draft.mode, ctx);
+      } else if (workerChanged && config.mode === "brain") {
+        // Same mode but worker settings changed: restart the live worker so the
+        // new model/thinking take effect on the next delegation.
+        await stopWorker(ctx);
+        await startWorker(ctx);
+      }
+
+      applyStatus(ctx, config, worker);
+    };
 
     await ctx.ui.custom<void>((tui, theme, _kb, done) => {
       const container = new Container();
-      container.addChild(new Text(theme.fg("accent", theme.bold("Herdr Worker Settings")), 1, 1));
+      const header = new Text(theme.fg("accent", theme.bold("Herdr Worker Settings")), 1, 1);
+      container.addChild(header);
 
       const items: SettingItem[] = [
         {
           id: "mode",
           label: "Mode",
           description: "regular = work directly; brain = orchestrate a spawned worker",
-          currentValue: config.mode,
+          currentValue: draft.mode,
           values: ["regular", "brain"],
         },
         {
           id: "brain-model",
           label: "Brain model",
           description: "Model for this orchestrator session (enter to pick)",
-          currentValue: brainModelValue(),
+          currentValue: brainModelDisplay(),
           submenu: modelSubmenu(ctx, false),
         },
         {
           id: "brain-thinking",
           label: "Brain thinking",
           description: "Thinking level for this orchestrator session",
-          currentValue: brainThinkingValue(),
+          currentValue: brainThinkingDisplay(),
           submenu: thinkingSubmenu(false),
         },
         {
           id: "worker-model",
           label: "Worker model",
           description: "Model used by the spawned worker (enter to pick)",
-          currentValue: displayWorkerModel(),
+          currentValue: workerModelDisplay(),
           submenu: modelSubmenu(ctx, true),
         },
         {
           id: "worker-thinking",
           label: "Worker thinking",
           description: "Thinking level used by the spawned worker",
-          currentValue: displayWorkerThinking(),
+          currentValue: workerThinkingDisplay(),
           submenu: thinkingSubmenu(true),
-        },
-        {
-          id: "worker",
-          label: "Worker process",
-          description: "Close the running worker (a new one spawns on next delegation)",
-          currentValue: worker ? `${worker.name} (running)` : "not running",
-          values: worker ? ["running", "close"] : ["not running"],
         },
         {
           id: "reset",
           label: "Reset overrides",
-          description: "Clear brain/worker model and thinking overrides",
+          description: "Clear brain/worker model and thinking overrides (in draft)",
           currentValue: "press enter",
           values: ["press enter", "reset"],
         },
       ];
+
+      const helpLine = new Text("", 1, 0);
+      const refreshHelp = () => {
+        const status = isDirty()
+          ? theme.fg("warning", "● unsaved changes")
+          : theme.fg("success", "● saved");
+        helpLine.setText(
+          `${status}  ${theme.fg("dim", "↑↓ navigate · enter cycle/pick · ctrl+s save · esc discard")}`,
+        );
+      };
 
       const settingsList = new SettingsList(
         items,
         Math.min(items.length + 2, 15),
         getSettingsListTheme(),
         (id, newValue) => {
-          void (async () => {
-            try {
-              if (id === "mode") {
-                if (newValue === "regular" || newValue === "brain") await setMode(newValue, ctx);
-                settingsList.updateValue("mode", config.mode);
-                settingsList.updateValue("worker", worker ? `${worker.name} (running)` : "not running");
-              } else if (id === "brain-model") {
-                await setBrainModel(newValue, ctx);
-                settingsList.updateValue("brain-model", brainModelValue());
-              } else if (id === "brain-thinking") {
-                if (validThinking(newValue)) setBrainThinking(newValue);
-                settingsList.updateValue("brain-thinking", brainThinkingValue());
-              } else if (id === "worker-model") {
-                if (newValue === "__inherit__") {
-                  config.workerModel = undefined;
-                  if (config.mode === "brain") {
-                    await stopWorker(ctx);
-                    await startWorker(ctx);
-                  }
-                } else {
-                  await applyWorkerSetting("worker-model", newValue, ctx);
-                }
-                settingsList.updateValue("worker-model", displayWorkerModel());
-              } else if (id === "worker-thinking") {
-                if (newValue === "__inherit__") {
-                  config.workerThinking = undefined;
-                  if (config.mode === "brain") {
-                    await stopWorker(ctx);
-                    await startWorker(ctx);
-                  }
-                } else if (validThinking(newValue)) {
-                  await applyWorkerSetting("worker-thinking", newValue, ctx);
-                }
-                settingsList.updateValue("worker-thinking", displayWorkerThinking());
-              } else if (id === "worker") {
-                if (newValue === "close" && worker) {
-                  await stopWorker(ctx);
-                }
-                settingsList.updateValue("worker", worker ? `${worker.name} (running)` : "not running");
-              } else if (id === "reset") {
-                if (newValue === "reset") {
-                  config.brainModel = undefined;
-                  config.brainThinking = undefined;
-                  config.workerModel = undefined;
-                  config.workerThinking = undefined;
-                  settingsList.updateValue("brain-model", brainModelValue());
-                  settingsList.updateValue("brain-thinking", brainThinkingValue());
-                  settingsList.updateValue("worker-model", displayWorkerModel());
-                  settingsList.updateValue("worker-thinking", displayWorkerThinking());
-                }
-                settingsList.updateValue("reset", "press enter");
-              }
-              applyStatus(ctx, config, worker);
-            } catch (error: any) {
-              notify(ctx, error.message, "error");
-            } finally {
-              tui.requestRender();
+          // Mutate the draft only — no live application here.
+          if (id === "mode") {
+            if (newValue === "regular" || newValue === "brain") draft.mode = newValue;
+            settingsList.updateValue("mode", draft.mode);
+          } else if (id === "brain-model") {
+            draft.brainModel = newValue;
+            settingsList.updateValue("brain-model", brainModelDisplay());
+          } else if (id === "brain-thinking") {
+            if (validThinking(newValue)) draft.brainThinking = newValue;
+            settingsList.updateValue("brain-thinking", brainThinkingDisplay());
+          } else if (id === "worker-model") {
+            draft.workerModel = newValue === "__inherit__" ? undefined : newValue;
+            settingsList.updateValue("worker-model", workerModelDisplay());
+          } else if (id === "worker-thinking") {
+            if (newValue === "__inherit__") draft.workerThinking = undefined;
+            else if (validThinking(newValue)) draft.workerThinking = newValue;
+            settingsList.updateValue("worker-thinking", workerThinkingDisplay());
+          } else if (id === "reset") {
+            if (newValue === "reset") {
+              draft.brainModel = undefined;
+              draft.brainThinking = undefined;
+              draft.workerModel = undefined;
+              draft.workerThinking = undefined;
+              settingsList.updateValue("brain-model", brainModelDisplay());
+              settingsList.updateValue("brain-thinking", brainThinkingDisplay());
+              settingsList.updateValue("worker-model", workerModelDisplay());
+              settingsList.updateValue("worker-thinking", workerThinkingDisplay());
             }
-          })();
+            settingsList.updateValue("reset", "press enter");
+          }
+          refreshHelp();
+          tui.requestRender();
         },
         () => done(undefined),
       );
       container.addChild(settingsList);
-      container.addChild(
-        new Text(theme.fg("dim", "↑↓ navigate · enter cycle/open · esc close"), 1, 0),
-      );
+      container.addChild(helpLine);
+      refreshHelp();
 
+      let saving = false;
       return {
         render: (w) => container.render(w),
         invalidate: () => container.invalidate(),
         handleInput: (data) => {
+          // Ctrl+S saves the draft. Intercept before the list so it is not
+          // treated as a printable character by an active search box.
+          if (matchesKey(data, Key.ctrl("s"))) {
+            if (saving || !isDirty()) return;
+            saving = true;
+            void (async () => {
+              try {
+                await saveDraft();
+                notify(ctx, "Worker settings saved.");
+                refreshHelp();
+              } catch (error: any) {
+                notify(ctx, error.message, "error");
+              } finally {
+                saving = false;
+                tui.requestRender();
+              }
+            })();
+            return;
+          }
           settingsList.handleInput?.(data);
           tui.requestRender();
         },
