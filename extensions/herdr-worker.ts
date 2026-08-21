@@ -1,7 +1,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -148,14 +148,18 @@ function runHerdr(args: string[], timeout = 30000): string {
 // Commands that create or close panes must not block the interactive TUI.
 // Herdr talks to a server over a socket and may wait for shell/agent
 // readiness; execFileSync here would make Ctrl+S appear to freeze Pi.
-function runHerdrAsync(args: string[], timeout = 30000): Promise<string> {
+function runHerdrAsync(args: string[], timeout = 30000, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       "herdr",
       args,
-      { encoding: "utf8", timeout },
+      { encoding: "utf8", timeout, signal },
       (error, stdout, stderr) => {
         if (error) {
+          if (signal?.aborted || error.name === "AbortError") {
+            reject(new Error("Herdr operation cancelled."));
+            return;
+          }
           const details = [String(stderr ?? "").trim(), String(stdout ?? "").trim()].filter(Boolean);
           reject(new Error(details.length ? `${error.message}: ${details.join(" | ")}` : error.message));
         } else {
@@ -164,6 +168,26 @@ function runHerdrAsync(args: string[], timeout = 30000): Promise<string> {
       },
     );
   });
+}
+
+function extractWorkerReport(transcript: string, marker: string): string {
+  const plain = transcript
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\r/g, "");
+  const start = `<<<${marker}_START>>>`;
+  const end = `<<<${marker}_END>>>`;
+  const startAt = plain.lastIndexOf(start);
+  if (startAt >= 0) {
+    const reportStart = startAt + start.length;
+    const endAt = plain.indexOf(end, reportStart);
+    if (endAt >= 0) return plain.slice(reportStart, endAt).trim();
+  }
+
+  // A model may omit the requested report markers. Keep the fallback bounded
+  // so terminal history, startup banners, and status bars do not flood the
+  // brain session's context or make the TUI expensive to render.
+  const lines = plain.split("\n");
+  return lines.slice(-60).join("\n").trim();
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -346,18 +370,68 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     return worker;
   };
 
-  const delegate = async (ctx: ExtensionContext, args: WorkerDelegateArgs) => {
+  const delegate = async (
+    ctx: ExtensionContext,
+    args: WorkerDelegateArgs,
+    signal?: AbortSignal,
+    onUpdate?: AgentToolUpdateCallback<unknown>,
+  ) => {
     if (config.mode !== "brain") await setMode("brain", ctx);
     if (!args.prompt.trim()) throw new Error("A worker prompt is required.");
+    if (signal?.aborted) throw new Error("Worker delegation cancelled.");
+    onUpdate?.({
+      content: [{ type: "text", text: "Delegation queued for the persistent worker…" }],
+      details: { role: args.role ?? "general", state: "queued" },
+    });
 
     const run = workerQueue.then(async () => {
+      if (signal?.aborted) throw new Error("Worker delegation cancelled.");
+      onUpdate?.({ content: [{ type: "text", text: "Starting delegated worker task…" }] });
       const active = await startWorker(ctx);
       const timeout = args.timeout ?? diskConfig.defaultTimeout ?? DEFAULT_WORKER_TIMEOUT;
       const role = args.role ?? "general";
-      const rolePrompt = `ROLE: ${role}. ${ROLE_PROMPTS[role]}\n\nTASK:\n${args.prompt}`;
-      runHerdr(["agent", "prompt", active.name, rolePrompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
-      const report = runHerdr(["agent", "read", active.name, "--source", "recent-unwrapped", "--lines", "200"]);
-      // Optionally tear down the worker (agent + Herdr pane) once the task is done.
+      const marker = `HERDR_REPORT_${Date.now().toString(36)}`;
+      const rolePrompt = [
+        `ROLE: ${role}. ${ROLE_PROMPTS[role]}`,
+        "",
+        "TASK:",
+        args.prompt,
+        "",
+        "RESPONSE FORMAT:",
+        `End with a concise final report. Begin it with the exact token formed by joining "<<<", "${marker}_START", and ">>>".`,
+        `End it with the exact token formed by joining "<<<", "${marker}_END", and ">>>".`,
+        "Put only the useful result, validation evidence, and remaining caveats between those tokens.",
+      ].join("\n");
+      onUpdate?.({
+        content: [{ type: "text", text: `Worker ${active.name} is running the ${role} delegation…` }],
+        details: { worker: active.name, role, state: "working" },
+      });
+      const interruptWorker = () => {
+        void runHerdrAsync(["agent", "send-keys", active.name, "ctrl+c"], 5000).catch(() => undefined);
+      };
+      signal?.addEventListener("abort", interruptWorker, { once: true });
+      try {
+        await runHerdrAsync(
+          ["agent", "prompt", active.name, rolePrompt, "--wait", "--timeout", String(timeout)],
+          timeout + 30000,
+          signal,
+        );
+      } finally {
+        signal?.removeEventListener("abort", interruptWorker);
+      }
+      if (signal?.aborted) throw new Error("Worker delegation cancelled.");
+      onUpdate?.({
+        content: [{ type: "text", text: `Worker ${active.name} finished; collecting its final report…` }],
+        details: { worker: active.name, role, state: "collecting" },
+      });
+      const transcript = await runHerdrAsync(
+        ["agent", "read", active.name, "--source", "recent-unwrapped", "--lines", "120"],
+        30000,
+        signal,
+      );
+      const report = extractWorkerReport(transcript, marker);
+      if (!report) throw new Error(`Worker ${active.name} completed without a readable report.`);
+      // Optionally tear down the worker (agent + Herdr tab) once the task is done.
       // The next delegation will spawn a fresh worker on demand.
       if (args.closeAfter) await stopWorker(ctx);
       return report;
@@ -884,8 +958,8 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       "Give worker_delegate one coherent objective, an explicit role, relevant files, constraints, and validation commands.",
     ],
     parameters: WorkerDelegateInput,
-    async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
-      const response = await delegate(ctx, input as WorkerDelegateArgs);
+    async execute(_toolCallId, input, signal, onUpdate, ctx) {
+      const response = await delegate(ctx, input as WorkerDelegateArgs, signal, onUpdate);
       return {
         content: [{ type: "text", text: response }],
         details: { worker: worker?.name, mode: config.mode },

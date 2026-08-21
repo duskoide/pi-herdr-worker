@@ -25,7 +25,7 @@ worker_delegate({
 })
 ```
 
-Roles are `general`, `explore`, `plan`, `impl`, `test`, `review`, and `simplify`. Explore, plan, review, and simplify are instructed to remain read-only.
+Roles are `general`, `explore`, `plan`, `impl`, `test`, `review`, and `simplify`. Explore, plan, review, and simplify are instructed to remain read-only. Delegation waits are asynchronous, report live status, support cancellation, and return only the worker's concise final report rather than its full terminal history.
 
 Close the worker when done:
 
