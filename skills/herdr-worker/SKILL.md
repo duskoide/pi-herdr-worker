@@ -45,7 +45,7 @@ TypeScript or Pi extension smoke check and report changed files and failures.
 
 The extension also keeps `/spawn`, `/spawnp`, `/spawnlist`, `/spawnkill`, and `spawn_pi` for short-lived or independent tasks. These create a temporary pane, run one prompt, return its output, and close the pane.
 
-Temporary agents can receive a model and thinking level from the command-line helper:
+Temporary agents are independent of the persistent `/worker-config` worker settings. They receive a model and thinking level from the command-line helper:
 
 ```bash
 ~/.pi/agent/bin/herdr-worker.sh <agent-name> "<prompt>" \

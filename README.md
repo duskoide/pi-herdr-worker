@@ -81,7 +81,7 @@ These commands remain available in both modes for short-lived, independent tasks
 /spawnkill pi-test-runner
 ```
 
-`spawn_pi` is also available as a tool:
+`spawn_pi` is also available as a tool. It is an independent one-shot agent and does not use the persistent `worker_delegate` settings from `/worker-config`; pass its `model` and `thinking` explicitly when needed:
 
 ```text
 spawn_pi({

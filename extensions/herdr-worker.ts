@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import {
@@ -88,6 +88,27 @@ function runHerdr(args: string[], timeout = 30000): string {
   });
 }
 
+// Commands that create or close panes must not block the interactive TUI.
+// Herdr talks to a server over a socket and may wait for shell/agent
+// readiness; execFileSync here would make Ctrl+S appear to freeze Pi.
+function runHerdrAsync(args: string[], timeout = 30000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "herdr",
+      args,
+      { encoding: "utf8", timeout },
+      (error, stdout, stderr) => {
+        if (error) {
+          const details = [String(stderr ?? "").trim(), String(stdout ?? "").trim()].filter(Boolean);
+          reject(new Error(details.length ? `${error.message}: ${details.join(" | ")}` : error.message));
+        } else {
+          resolve(String(stdout));
+        }
+      },
+    );
+  });
+}
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // A freshly split pane is not immediately an available shell; Herdr reports
@@ -96,11 +117,18 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 async function waitForShell(startArgs: string[], paneId: string, attempts = 25, delayMs = 200): Promise<void> {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      runHerdr(startArgs);
+      await runHerdrAsync(startArgs);
       return;
     } catch (error: any) {
-      const message = error.message ?? "";
-      if (!message.includes("agent_pane_busy") && !message.includes("not an available shell")) {
+      const message = String(error?.message ?? error ?? "").toLowerCase();
+      const transientPaneError =
+        message.includes("agent_pane_busy") ||
+        message.includes("pane_busy") ||
+        message.includes("not an available shell") ||
+        message.includes("pane is not available") ||
+        message.includes("shell is not ready") ||
+        message.includes("not ready");
+      if (!transientPaneError) {
         throw error;
       }
       await sleep(delayMs);
@@ -122,8 +150,8 @@ function describeConfig(config: WorkerConfig, worker: WorkerHandle | undefined, 
     `mode: ${config.mode}`,
     `brain model: ${config.brainModel ?? currentModelId(ctx) ?? "current"}`,
     `brain thinking: ${config.brainThinking ?? ctx.thinkingLevel ?? "current"}`,
-    `worker model: ${config.workerModel ?? currentModelId(ctx) ?? "parent model"}`,
-    `worker thinking: ${config.workerThinking ?? ctx.thinkingLevel ?? "parent level"}`,
+    `worker model: ${config.workerModel ?? config.brainModel ?? currentModelId(ctx) ?? "parent model"}`,
+    `worker thinking: ${config.workerThinking ?? config.brainThinking ?? ctx.thinkingLevel ?? "parent level"}`,
     `worker: ${worker ? `${worker.name} (${worker.paneId})` : "not running"}`,
     "",
     "Run /worker-config with no arguments to open the interactive settings UI, or use:",
@@ -159,8 +187,10 @@ function findModel(ctx: ExtensionContext, requested: string) {
   return ctx.modelRegistry.getAvailable().find((model) => model.id === requested);
 }
 
-function modelArgument(ctx: ExtensionContext, configured: string | undefined): string | undefined {
-  return configured ?? currentModelId(ctx);
+function modelArgument(ctx: ExtensionContext, config: WorkerConfig): string | undefined {
+  // Worker inheritance must prefer the saved brain override. ctx.model can
+  // still expose the previous model during the same command that changed it.
+  return config.workerModel ?? config.brainModel ?? currentModelId(ctx);
 }
 
 function validThinking(value: string): value is ThinkingLevel {
@@ -177,6 +207,16 @@ function closeWorker(worker: WorkerHandle | undefined) {
   }
 }
 
+async function closeWorkerAsync(worker: WorkerHandle | undefined): Promise<void> {
+  if (!worker) return;
+  try {
+    if (worker.tabId) await runHerdrAsync(["tab", "close", worker.tabId]);
+    else await runHerdrAsync(["pane", "close", worker.paneId]);
+  } catch {
+    // The tab or pane may already have been closed by Herdr or the user.
+  }
+}
+
 export default function herdrSpawn(pi: ExtensionAPI) {
   // This state intentionally lives only in the extension instance. It resets to
   // regular mode whenever pi opens, reloads, or switches sessions.
@@ -187,7 +227,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   const stopWorker = async (ctx?: ExtensionContext) => {
     const active = worker;
     worker = undefined;
-    closeWorker(active);
+    await closeWorkerAsync(active);
     if (ctx) applyStatus(ctx, config, worker);
   };
 
@@ -203,21 +243,25 @@ export default function herdrSpawn(pi: ExtensionAPI) {
         tab?: { tab_id?: string };
         root_pane?: { pane_id?: string };
       };
-    }>(runHerdr(["tab", "create", "--cwd", ctx.cwd, "--label", name, "--no-focus"]));
+    }>(await runHerdrAsync(["tab", "create", "--cwd", ctx.cwd, "--label", name, "--no-focus"]));
     const tabId = created.result?.tab?.tab_id;
     const paneId = created.result?.root_pane?.pane_id;
     if (!tabId || !paneId) throw new Error("Could not create a Herdr worker tab.");
     const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
-    const model = modelArgument(ctx, config.workerModel);
+    const model = modelArgument(ctx, config);
+    const thinking = config.workerThinking ?? config.brainThinking ?? ctx.thinkingLevel;
     if (model) startArgs.push("--model", model);
-    if (config.workerThinking ?? ctx.thinkingLevel) startArgs.push("--thinking", config.workerThinking ?? ctx.thinkingLevel);
+    if (thinking) startArgs.push("--thinking", thinking);
     startArgs.push("--append-system-prompt", WORKER_SYSTEM_PROMPT);
 
     try {
       await waitForShell(startArgs, paneId);
-    } catch (error) {
-      closeWorker({ name, paneId, tabId });
-      throw error;
+    } catch (error: any) {
+      await closeWorkerAsync({ name, paneId, tabId });
+      const detail = String(error?.message ?? error ?? "");
+      throw new Error(
+        `Could not start worker ${name} with model ${model ?? "default"} and thinking ${thinking ?? "default"}: ${detail}`,
+      );
     }
 
     worker = { name, paneId, tabId };
@@ -292,8 +336,12 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     value: string,
     ctx: ExtensionContext,
   ) => {
-    if (key === "worker-model") config.workerModel = value;
-    else config.workerThinking = value as ThinkingLevel;
+    if (key === "worker-model") {
+      if (!findModel(ctx, value)) throw new Error(`Model not found: ${value}`);
+      config.workerModel = value;
+    } else {
+      config.workerThinking = value as ThinkingLevel;
+    }
     if (config.mode === "brain") {
       await stopWorker(ctx);
       await startWorker(ctx);
@@ -439,26 +487,34 @@ export default function herdrSpawn(pi: ExtensionAPI) {
 
     // Apply the draft to the live config and reconcile the worker/model/thinking.
     const saveDraft = async () => {
+      const brainModelChanged = draft.brainModel !== config.brainModel;
+      const brainThinkingChanged = draft.brainThinking !== config.brainThinking;
+
       // Brain model: authenticate and switch the current session's model.
-      if (draft.brainModel !== config.brainModel && draft.brainModel) {
-        await setBrainModel(draft.brainModel, ctx);
+      if (brainModelChanged) {
+        if (draft.brainModel) await setBrainModel(draft.brainModel, ctx);
+        else config.brainModel = undefined;
       }
-      // Brain thinking level applies to this session.
-      if (draft.brainThinking !== config.brainThinking && draft.brainThinking) {
-        setBrainThinking(draft.brainThinking);
+      // Brain thinking level applies to this session. Resetting the override
+      // deliberately leaves the current Pi level unchanged, but restores
+      // inheritance for future worker starts.
+      if (draft.brainThinking !== config.brainThinking) {
+        if (draft.brainThinking) setBrainThinking(draft.brainThinking);
+        else config.brainThinking = undefined;
       }
 
-      // Worker model/thinking only change stored config here; the worker is
-      // restarted once below if anything worker-affecting changed.
       const workerChanged =
         draft.workerModel !== config.workerModel || draft.workerThinking !== config.workerThinking;
+      const inheritedWorkerChanged =
+        (draft.workerModel === undefined && brainModelChanged) ||
+        (draft.workerThinking === undefined && brainThinkingChanged);
       config.workerModel = draft.workerModel;
       config.workerThinking = draft.workerThinking;
 
       // Mode change spawns or tears down the worker as needed.
       if (draft.mode !== config.mode) {
         await setMode(draft.mode, ctx);
-      } else if (workerChanged && config.mode === "brain") {
+      } else if ((workerChanged || inheritedWorkerChanged) && config.mode === "brain") {
         // Same mode but worker settings changed: restart the live worker so the
         // new model/thinking take effect on the next delegation.
         await stopWorker(ctx);
@@ -519,10 +575,13 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       ];
 
       const helpLine = new Text("", 1, 0);
+      let saving = false;
       const refreshHelp = () => {
-        const status = isDirty()
-          ? theme.fg("warning", "● unsaved changes")
-          : theme.fg("success", "● saved");
+        const status = saving
+          ? theme.fg("accent", "◌ saving…")
+          : isDirty()
+            ? theme.fg("warning", "● unsaved changes")
+            : theme.fg("success", "● saved");
         helpLine.setText(
           `${status}  ${theme.fg("dim", "↑↓ navigate · enter cycle/pick · ctrl+s save · esc discard")}`,
         );
@@ -572,7 +631,6 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       container.addChild(helpLine);
       refreshHelp();
 
-      let saving = false;
       return {
         render: (w) => container.render(w),
         invalidate: () => container.invalidate(),
@@ -582,20 +640,23 @@ export default function herdrSpawn(pi: ExtensionAPI) {
           if (matchesKey(data, Key.ctrl("s"))) {
             if (saving || !isDirty()) return;
             saving = true;
+            refreshHelp();
+            tui.requestRender();
             void (async () => {
               try {
                 await saveDraft();
                 notify(ctx, "Worker settings saved.");
-                refreshHelp();
               } catch (error: any) {
                 notify(ctx, error.message, "error");
               } finally {
                 saving = false;
+                refreshHelp();
                 tui.requestRender();
               }
             })();
             return;
           }
+          if (saving) return;
           settingsList.handleInput?.(data);
           tui.requestRender();
         },
