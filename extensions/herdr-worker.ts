@@ -1,6 +1,9 @@
 import { execFile, execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import {
   Container,
   type Component,
@@ -30,19 +33,36 @@ const THINKING_ORDER: ThinkingLevel[] = [
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(THINKING_ORDER);
 
-const MUTATING_TOOLS = new Set([
-  "write",
-  "edit",
-  "bash",
-  "apply_patch",
-  "patch",
-  "delete",
-  "move",
+const BRAIN_ALLOWED_TOOLS = new Set([
+  "worker_mode",
+  "worker_delegate",
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "ffgrep",
+  "fffind",
+  "todo",
+  "ask_user_question",
+  "graphify_query",
+  "graphify_path",
+  "graphify_explain",
+  "web_search",
+  "web_fetch",
+  "web_fetch_md",
+  "web_docs_search",
+  "web_docs_fetch",
+  "query-docs",
+  "resolve-library-id",
 ]);
+
+const WORKER_ROLES = ["general", "explore", "plan", "impl", "test", "review", "simplify"] as const;
+type WorkerRole = (typeof WORKER_ROLES)[number];
 
 const WorkerDelegateInput = Type.Object({
   prompt: Type.String({ description: "A complete implementation, testing, or review task for the spawned worker" }),
-  timeout: Type.Optional(Type.Number({ description: "Worker timeout in milliseconds (default: 300000)" })),
+  role: Type.Optional(StringEnum(WORKER_ROLES, { description: "Worker role for this delegation (default: general)" })),
+  timeout: Type.Optional(Type.Number({ description: "Worker timeout in milliseconds; defaults to herdr-worker.json" })),
   closeAfter: Type.Optional(
     Type.Boolean({
       description:
@@ -53,6 +73,7 @@ const WorkerDelegateInput = Type.Object({
 
 type WorkerDelegateArgs = {
   prompt: string;
+  role?: WorkerRole;
   timeout?: number;
   closeAfter?: boolean;
 };
@@ -71,14 +92,50 @@ type WorkerConfig = {
   workerThinking?: ThinkingLevel;
 };
 
+type DiskWorkerConfig = {
+  defaultModel?: string;
+  allowedModels?: string[];
+  defaultThinking?: ThinkingLevel;
+  defaultTimeout?: number;
+};
+
 const DEFAULT_WORKER_TIMEOUT = 300000;
 const WORKER_SYSTEM_PROMPT = [
-  "You are the implementation worker for a parent pi session.",
-  "The parent session is the orchestrator. Execute the delegated task directly in this repository.",
-  "You may inspect files, edit source, run tests, and validate the result.",
+  "You are the execution worker for a parent pi session.",
+  "The parent session is the orchestrator. Execute each delegated task directly in this repository according to its stated role.",
+  "You may inspect files, edit source, run tests, and validate the result when the role permits it.",
   "Do not delegate work to another agent and do not use worker-mode commands.",
-  "Return a concise report containing changes made, validation performed, and any blockers.",
+  "Return a concise report containing findings or changes, validation performed, and any blockers.",
 ].join(" ");
+
+const ROLE_PROMPTS: Record<WorkerRole, string> = {
+  general: "Complete the delegated objective end to end.",
+  explore: "Act as a read-only explorer. Gather evidence and do not modify files.",
+  plan: "Act as a planner. Produce a concrete, testable plan and do not modify files.",
+  impl: "Act as the implementer. Make only the requested changes and run relevant validation.",
+  test: "Act as the test specialist. Exercise the requested behavior, add or fix tests only when requested, and report failures precisely.",
+  review: "Act as a read-only reviewer. Identify actionable correctness, security, and regression risks; do not modify files.",
+  simplify: "Act as a read-only simplification reviewer. Find unnecessary complexity without changing behavior; do not modify files.",
+};
+
+function loadDiskWorkerConfig(): DiskWorkerConfig {
+  try {
+    const parsed = JSON.parse(readFileSync(join(getAgentDir(), "herdr-worker.json"), "utf8")) as DiskWorkerConfig;
+    return {
+      defaultModel: typeof parsed.defaultModel === "string" ? parsed.defaultModel : undefined,
+      allowedModels: Array.isArray(parsed.allowedModels)
+        ? parsed.allowedModels.filter((value): value is string => typeof value === "string")
+        : undefined,
+      defaultThinking: parsed.defaultThinking && validThinking(parsed.defaultThinking) ? parsed.defaultThinking : undefined,
+      defaultTimeout:
+        typeof parsed.defaultTimeout === "number" && Number.isFinite(parsed.defaultTimeout) && parsed.defaultTimeout > 0
+          ? parsed.defaultTimeout
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
 
 function runHerdr(args: string[], timeout = 30000): string {
   return execFileSync("herdr", args, {
@@ -218,11 +275,27 @@ async function closeWorkerAsync(worker: WorkerHandle | undefined): Promise<void>
 }
 
 export default function herdrSpawn(pi: ExtensionAPI) {
-  // This state intentionally lives only in the extension instance. It resets to
-  // regular mode whenever pi opens, reloads, or switches sessions.
-  const config: WorkerConfig = { mode: "regular" };
+  // Mode is session-only, while worker defaults come from the portable config.
+  const diskConfig = loadDiskWorkerConfig();
+  const config: WorkerConfig = {
+    mode: "regular",
+    workerModel: diskConfig.defaultModel,
+    workerThinking: diskConfig.defaultThinking,
+  };
   let worker: WorkerHandle | undefined;
   let workerQueue: Promise<unknown> = Promise.resolve();
+  let regularTools: string[] | undefined;
+
+  const applyToolMode = (mode: Mode) => {
+    if (mode === "brain") {
+      regularTools ??= pi.getActiveTools();
+      const active = pi.getActiveTools().filter((name) => BRAIN_ALLOWED_TOOLS.has(name));
+      pi.setActiveTools([...new Set([...active, "worker_mode", "worker_delegate"])]);
+    } else if (regularTools) {
+      pi.setActiveTools(regularTools);
+      regularTools = undefined;
+    }
+  };
 
   const stopWorker = async (ctx?: ExtensionContext) => {
     const active = worker;
@@ -250,6 +323,10 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
     const model = modelArgument(ctx, config);
     const thinking = config.workerThinking ?? config.brainThinking ?? ctx.thinkingLevel;
+    if (model && !workerModelAllowed(model)) {
+      await closeWorkerAsync({ name, paneId, tabId });
+      throw new Error(`Worker model is not allowed by herdr-worker.json: ${model}`);
+    }
     if (model) startArgs.push("--model", model);
     if (thinking) startArgs.push("--thinking", thinking);
     startArgs.push("--append-system-prompt", WORKER_SYSTEM_PROMPT);
@@ -270,15 +347,15 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   };
 
   const delegate = async (ctx: ExtensionContext, args: WorkerDelegateArgs) => {
-    if (config.mode !== "brain") {
-      throw new Error("Brain mode is not active. Run /worker-config mode brain first.");
-    }
+    if (config.mode !== "brain") await setMode("brain", ctx);
     if (!args.prompt.trim()) throw new Error("A worker prompt is required.");
 
     const run = workerQueue.then(async () => {
       const active = await startWorker(ctx);
-      const timeout = args.timeout ?? DEFAULT_WORKER_TIMEOUT;
-      runHerdr(["agent", "prompt", active.name, args.prompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
+      const timeout = args.timeout ?? diskConfig.defaultTimeout ?? DEFAULT_WORKER_TIMEOUT;
+      const role = args.role ?? "general";
+      const rolePrompt = `ROLE: ${role}. ${ROLE_PROMPTS[role]}\n\nTASK:\n${args.prompt}`;
+      runHerdr(["agent", "prompt", active.name, rolePrompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
       const report = runHerdr(["agent", "read", active.name, "--source", "recent-unwrapped", "--lines", "200"]);
       // Optionally tear down the worker (agent + Herdr pane) once the task is done.
       // The next delegation will spawn a fresh worker on demand.
@@ -288,6 +365,13 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     workerQueue = run.catch(() => undefined);
     return run;
   };
+
+  function workerModelAllowed(requested: string): boolean {
+    const allowed = diskConfig.allowedModels;
+    if (!allowed?.length) return true;
+    const bare = requested.includes("/") ? requested.split("/", 2)[1]! : requested;
+    return allowed.some((value) => value === requested || value === bare || value.endsWith(`/${bare}`));
+  }
 
   const setBrainModel = async (requested: string, ctx: ExtensionContext) => {
     const model = findModel(ctx, requested);
@@ -305,19 +389,22 @@ export default function herdrSpawn(pi: ExtensionAPI) {
 
     if (mode === "brain") {
       config.mode = "brain";
+      applyToolMode("brain");
       try {
         await startWorker(ctx);
       } catch (error: any) {
         config.mode = "regular";
+        applyToolMode("regular");
         applyStatus(ctx, config, worker);
         throw new Error(error.message);
       }
       notify(
         ctx,
-        "Brain mode enabled. This session is now the orchestrator (brain): plan and delegate all implementation and validation to the spawned worker with worker_delegate. Your own mutation tools are blocked.",
+        "Brain mode enabled. This session is now the orchestrator (brain): plan and delegate all implementation and validation to the persistent worker with worker_delegate. Only approved coordination and read-only tools remain active.",
       );
     } else {
       config.mode = "regular";
+      applyToolMode("regular");
       await stopWorker(ctx);
       notify(ctx, "Regular mode enabled. This session works directly again; the worker and its Herdr pane have been closed.");
     }
@@ -337,6 +424,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     ctx: ExtensionContext,
   ) => {
     if (key === "worker-model") {
+      if (!workerModelAllowed(value)) throw new Error(`Worker model is not allowed by herdr-worker.json: ${value}`);
       if (!findModel(ctx, value)) throw new Error(`Model not found: ${value}`);
       config.workerModel = value;
     } else {
@@ -427,6 +515,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       }
       for (const model of available) {
         const id = `${model.provider}/${model.id}`;
+        if (includeInherit && !workerModelAllowed(id)) continue;
         items.push({ value: id, label: id, description: model.provider });
       }
 
@@ -505,6 +594,9 @@ export default function herdrSpawn(pi: ExtensionAPI) {
 
       const workerChanged =
         draft.workerModel !== config.workerModel || draft.workerThinking !== config.workerThinking;
+      if (draft.workerModel && !workerModelAllowed(draft.workerModel)) {
+        throw new Error(`Worker model is not allowed by herdr-worker.json: ${draft.workerModel}`);
+      }
       const inheritedWorkerChanged =
         (draft.workerModel === undefined && brainModelChanged) ||
         (draft.workerThinking === undefined && brainThinkingChanged);
@@ -613,8 +705,8 @@ export default function herdrSpawn(pi: ExtensionAPI) {
             if (newValue === "reset") {
               draft.brainModel = undefined;
               draft.brainThinking = undefined;
-              draft.workerModel = undefined;
-              draft.workerThinking = undefined;
+              draft.workerModel = diskConfig.defaultModel;
+              draft.workerThinking = diskConfig.defaultThinking;
               settingsList.updateValue("brain-model", brainModelDisplay());
               settingsList.updateValue("brain-thinking", brainThinkingDisplay());
               settingsList.updateValue("worker-model", workerModelDisplay());
@@ -666,9 +758,12 @@ export default function herdrSpawn(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     config.mode = "regular";
+    config.workerModel = diskConfig.defaultModel;
+    config.workerThinking = diskConfig.defaultThinking;
     worker = undefined;
+    regularTools = undefined;
     applyStatus(ctx, config, worker);
-    notify(ctx, "Herdr worker ready in regular mode. Use /worker-config mode brain to make this session the orchestrator.");
+    notify(ctx, "Herdr worker ready in regular mode. The agent can enter brain mode with worker_mode or automatically through worker_delegate; /worker-config remains available for manual control.");
   });
 
   pi.on("session_shutdown", async () => {
@@ -679,15 +774,15 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     if (config.mode !== "brain") return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\nBRAIN MODE (ORCHESTRATOR): This session has switched roles and is now the brain. You must exclusively orchestrate and delegate; you do not do implementation work yourself. Do not use write, edit, bash, apply_patch, patch, delete, or move tools. Delegate all implementation, testing, and other non-trivial work to the spawned worker with worker_delegate, then inspect and summarize the worker's report. Keep delegation prompts complete and specific.`,
+      systemPrompt: `${event.systemPrompt}\n\nBRAIN MODE (ORCHESTRATOR): This session has switched roles and is now the brain. You must exclusively orchestrate and delegate; you do not perform implementation or other non-trivial work yourself. Use only the currently available coordination and read-only tools. Delegate implementation, testing, and other non-trivial work to the persistent worker with worker_delegate, using its role field and a complete, specific prompt. Inspect each report, delegate corrections when needed, and summarize verified results. Use worker_mode to return to regular mode when orchestration is complete.`,
     };
   });
 
   pi.on("tool_call", async (event) => {
-    if (config.mode === "brain" && MUTATING_TOOLS.has(event.toolName)) {
+    if (config.mode === "brain" && !BRAIN_ALLOWED_TOOLS.has(event.toolName)) {
       return {
         block: true,
-        reason: `Blocked in brain mode: ${event.toolName} is a mutation tool. You are the orchestrator — delegate this work to the worker with worker_delegate.`,
+        reason: `Blocked in brain mode: ${event.toolName} is not an approved orchestration/read-only tool. Delegate the work with worker_delegate or return to regular mode with worker_mode.`,
       };
     }
   });
@@ -721,7 +816,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
           } else {
             const name = worker.name;
             await stopWorker(ctx);
-            notify(ctx, `Closed worker ${name} and its Herdr pane. Mode remains ${config.mode}; a new worker spawns on the next delegation.`);
+            notify(ctx, `Closed worker ${name} and its Herdr tab. Mode remains ${config.mode}; a new worker spawns on the next delegation.`);
           }
         } else if (key === "brain-model") {
           if (!value) throw new Error("Usage: /worker-config brain-model <provider/model>");
@@ -741,9 +836,9 @@ export default function herdrSpawn(pi: ExtensionAPI) {
         } else if (key === "reset") {
           config.brainModel = undefined;
           config.brainThinking = undefined;
-          config.workerModel = undefined;
-          config.workerThinking = undefined;
-          notify(ctx, "Worker configuration reset. Mode remains unchanged.");
+          config.workerModel = diskConfig.defaultModel;
+          config.workerThinking = diskConfig.defaultThinking;
+          notify(ctx, "Worker configuration reset to herdr-worker.json defaults. Mode remains unchanged.");
         } else {
           throw new Error("Usage: /worker-config [ui|show|mode|close|brain-model|brain-thinking|worker-model|worker-thinking|reset] ... (run with no arguments to open the settings UI)");
         }
@@ -755,39 +850,71 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "worker_mode",
+    label: "Worker Mode",
+    description:
+      "Enter or leave brain/orchestrator mode without requiring a slash command, inspect status, or close the live worker. Enter brain mode before executing a worker-driven plan.",
+    promptSnippet: "Switch this session between direct work and brain/orchestrator mode",
+    promptGuidelines: [
+      "Use worker_mode with mode brain when the user selects worker-driven execution; no slash command is required.",
+      "Use worker_mode with mode regular when delegated execution is complete and direct work should resume.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["brain", "regular", "status", "close"] as const),
+    }),
+    async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
+      const action = (input as { action: "brain" | "regular" | "status" | "close" }).action;
+      if (action === "brain" || action === "regular") await setMode(action, ctx);
+      else if (action === "close") await stopWorker(ctx);
+      return {
+        content: [{ type: "text", text: describeConfig(config, worker, ctx) }],
+        details: { mode: config.mode, worker: worker?.name },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "worker_delegate",
     label: "Worker Delegate",
     description:
-      "Delegate implementation, testing, review, or other non-trivial work to the spawned Herdr worker. Use this in brain mode: this session is the orchestrator and does not do the work itself. The worker persists across delegations by default; pass closeAfter: true to close the worker and its Herdr pane once the task completes.",
+      "Delegate implementation, testing, review, or other non-trivial work to the spawned Herdr worker. If needed, this safely enters brain mode first, so no slash command is required. The worker persists across delegations by default; pass closeAfter: true to close the worker and its Herdr tab once the task completes.",
+    promptSnippet: "Delegate a role-specific task to the persistent Herdr worker; automatically enters brain mode",
+    promptGuidelines: [
+      "Use worker_delegate for the entire approved worker-driven plan; it automatically enters brain mode when necessary.",
+      "Give worker_delegate one coherent objective, an explicit role, relevant files, constraints, and validation commands.",
+    ],
     parameters: WorkerDelegateInput,
     async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
-      try {
-        const response = await delegate(ctx, input as WorkerDelegateArgs);
-        return {
-          content: [{ type: "text", text: response }],
-          details: { worker: worker?.name, mode: config.mode },
-        };
-      } catch (error: any) {
-        return {
-          content: [{ type: "text", text: error.message }],
-          details: { mode: config.mode },
-          isError: true,
-        };
-      }
+      const response = await delegate(ctx, input as WorkerDelegateArgs);
+      return {
+        content: [{ type: "text", text: response }],
+        details: { worker: worker?.name, mode: config.mode },
+      };
     },
   });
 
   pi.registerCommand("spawn", {
-    description: "Spawn a pi agent: /spawn <prompt> [--name <name>] [--model <model>] [--timeout <ms>]",
+    description: "Spawn a Pi agent in a temporary tab: /spawn <prompt> [--name <name>] [--model <model>] [--thinking <level>] [--timeout <ms>]",
     handler: async (args, ctx) => {
       try {
         const parsed = parseSpawnArgs(args);
         if (!parsed.prompt) {
-          notify(ctx, "Usage: /spawn <prompt> [--name <name>] [--model <model>] [--timeout <ms>]", "error");
+          notify(ctx, "Usage: /spawn <prompt> [--name <name>] [--model <model>] [--thinking <level>] [--timeout <ms>]", "error");
           return;
         }
-        const result = await runOneShot(parsed.prompt, parsed.name ?? `pi-${Date.now().toString(36)}`, parsed.model, parsed.timeout, ctx.cwd);
-        notify(ctx, result, result.startsWith("Failed") ? "error" : "info");
+        const selectedModel = parsed.model ?? diskConfig.defaultModel;
+        if (selectedModel && !workerModelAllowed(selectedModel)) {
+          throw new Error(`Worker model is not allowed by herdr-worker.json: ${selectedModel}`);
+        }
+        const result = await runOneShot(
+          parsed.prompt,
+          parsed.name ?? `pi-${Date.now().toString(36)}`,
+          selectedModel,
+          parsed.thinking ?? diskConfig.defaultThinking,
+          parsed.timeout ?? diskConfig.defaultTimeout ?? 120000,
+          ctx.cwd,
+        );
+        notify(ctx, result, "info");
       } catch (error: any) {
         notify(ctx, error.message, "error");
       }
@@ -803,7 +930,21 @@ export default function herdrSpawn(pi: ExtensionAPI) {
           notify(ctx, "Usage: /spawnp <prompt> [--model <model>]", "error");
           return;
         }
-        notify(ctx, await runOneShot(parsed.prompt, `pi-${Date.now().toString(36)}`, parsed.model, parsed.timeout, ctx.cwd));
+        const selectedModel = parsed.model ?? diskConfig.defaultModel;
+        if (selectedModel && !workerModelAllowed(selectedModel)) {
+          throw new Error(`Worker model is not allowed by herdr-worker.json: ${selectedModel}`);
+        }
+        notify(
+          ctx,
+          await runOneShot(
+            parsed.prompt,
+            `pi-${Date.now().toString(36)}`,
+            selectedModel,
+            parsed.thinking ?? diskConfig.defaultThinking,
+            parsed.timeout ?? diskConfig.defaultTimeout ?? 120000,
+            ctx.cwd,
+          ),
+        );
       } catch (error: any) {
         notify(ctx, error.message, "error");
       }
@@ -845,64 +986,94 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_pi",
     label: "Spawn Pi",
-    description: "Spawn a temporary pi agent in a new Herdr pane, wait for its response, then clean it up.",
+    description: "Spawn a temporary pi agent in a new Herdr tab, wait for its response, then clean it up.",
     parameters: Type.Object({
       prompt: Type.String({ description: "The prompt to send" }),
       name: Type.Optional(Type.String()),
       model: Type.Optional(Type.String()),
+      thinking: Type.Optional(StringEnum(THINKING_ORDER, { description: "Thinking level override" })),
       timeout: Type.Optional(Type.Number()),
-      direction: Type.Optional(Type.Union([Type.Literal("right"), Type.Literal("down")])),
+      direction: Type.Optional(Type.Union([Type.Literal("right"), Type.Literal("down")], { description: "Deprecated compatibility field; temporary agents now always use a new tab" })),
     }),
     async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
-      const value = input as { prompt: string; name?: string; model?: string; timeout?: number; direction?: "right" | "down" };
+      const value = input as { prompt: string; name?: string; model?: string; thinking?: ThinkingLevel; timeout?: number; direction?: "right" | "down" };
       const name = value.name || `pi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-      const response = await runOneShot(value.prompt, name, value.model, value.timeout ?? 120000, ctx.cwd, value.direction ?? "right");
+      const selectedModel = value.model ?? diskConfig.defaultModel;
+      if (selectedModel && !workerModelAllowed(selectedModel)) {
+        throw new Error(`Worker model is not allowed by herdr-worker.json: ${selectedModel}`);
+      }
+      const response = await runOneShot(
+        value.prompt,
+        name,
+        selectedModel,
+        value.thinking ?? diskConfig.defaultThinking,
+        value.timeout ?? diskConfig.defaultTimeout ?? 120000,
+        ctx.cwd,
+      );
       return { content: [{ type: "text", text: response }], details: { agent_name: name } };
     },
   });
 }
 
-function parseSpawnArgs(args: string): { prompt: string; name?: string; model?: string; timeout: number } {
+function parseSpawnArgs(args: string): { prompt: string; name?: string; model?: string; thinking?: ThinkingLevel; timeout?: number } {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const promptTokens: string[] = [];
   let name: string | undefined;
   let model: string | undefined;
-  let timeout = 120000;
+  let thinking: ThinkingLevel | undefined;
+  let timeout: number | undefined;
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
-    if (token === "--name" || token === "--model" || token === "--timeout") {
+    if (token === "--name" || token === "--model" || token === "--thinking" || token === "--timeout") {
       const value = tokens[++index];
       if (!value) throw new Error(`${token} requires a value`);
       if (token === "--name") name = value;
       else if (token === "--model") model = value;
-      else timeout = Number(value);
+      else if (token === "--thinking") {
+        if (!validThinking(value)) throw new Error(`Invalid thinking level: ${value}`);
+        thinking = value;
+      } else timeout = Number(value);
     } else {
       promptTokens.push(token);
     }
   }
 
-  if (!Number.isFinite(timeout) || timeout <= 0) throw new Error("--timeout must be a positive number");
-  return { prompt: promptTokens.join(" "), name, model, timeout };
+  if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) {
+    throw new Error("--timeout must be a positive number");
+  }
+  return { prompt: promptTokens.join(" "), name, model, thinking, timeout };
 }
 
-async function runOneShot(prompt: string, name: string, model: string | undefined, timeout: number, cwd: string, direction = "right"): Promise<string> {
-  if (process.env.HERDR_ENV !== "1") return "Failed: Not running in Herdr environment. Cannot spawn pane.";
+async function runOneShot(
+  prompt: string,
+  name: string,
+  model: string | undefined,
+  thinking: ThinkingLevel | undefined,
+  timeout: number,
+  cwd: string,
+): Promise<string> {
+  if (process.env.HERDR_ENV !== "1") throw new Error("Not running in Herdr environment. Cannot spawn worker tab.");
   let paneId: string | undefined;
+  let tabId: string | undefined;
   try {
-    const split = parseJson<{ result?: { pane?: { pane_id?: string } } }>(runHerdr(["pane", "split", "--current", "--direction", direction, "--cwd", cwd, "--no-focus"]));
-    paneId = split.result?.pane?.pane_id;
-    if (!paneId) throw new Error("Could not create new pane");
+    const created = parseJson<{ result?: { tab?: { tab_id?: string }; root_pane?: { pane_id?: string } } }>(
+      runHerdr(["tab", "create", "--cwd", cwd, "--label", name, "--no-focus"]),
+    );
+    tabId = created.result?.tab?.tab_id;
+    paneId = created.result?.root_pane?.pane_id;
+    if (!tabId || !paneId) throw new Error("Could not create new worker tab");
     const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
     if (model) startArgs.push("--model", model);
+    if (thinking) startArgs.push("--thinking", thinking);
     await waitForShell(startArgs, paneId);
     runHerdr(["agent", "prompt", name, prompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
     const response = runHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "100"]);
-    return `Agent ${name} completed in pane ${paneId}\n\n${response}`;
-  } catch (error: any) {
-    return `Failed: ${error.message}`;
+    return `Agent ${name} completed in tab ${tabId}\n\n${response}`;
   } finally {
-    if (paneId) {
+    if (tabId) {
+      try { runHerdr(["tab", "close", tabId]); } catch { /* best effort cleanup */ }
+    } else if (paneId) {
       try { runHerdr(["pane", "close", paneId]); } catch { /* best effort cleanup */ }
     }
   }

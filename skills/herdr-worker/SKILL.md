@@ -12,40 +12,31 @@ This extension supports two session-only modes:
 
 ## Brain-mode workflow
 
-1. Start Pi. The extension initializes in regular mode.
-2. Configure the roles with `/worker-config`:
-   - `mode regular|brain`
-   - `brain-model <provider/model>`
-   - `brain-thinking <off|minimal|low|medium|high|xhigh|max>`
-   - `worker-model <provider/model>`
-   - `worker-thinking <off|minimal|low|medium|high|xhigh|max>`
-3. Entering brain mode switches the current session to the brain role, creates a new worker tab, and keeps it alive for the session.
-4. In brain mode, the brain plans and delegates through `worker_delegate`. Delegations are serialized and the worker reports back after each task.
-5. The brain must not perform non-trivial mutations. Write, edit, bash, patch, delete, and move tool calls are blocked; trivial coordination is still possible through commands and status updates.
-6. Close the worker (agent + Herdr tab) when you no longer need it:
-   - `worker_delegate({ prompt: "...", closeAfter: true })` closes it right after the delegated task finishes.
-   - `/worker-config close` closes it on demand while staying in brain mode; the next delegation spawns a fresh worker.
-   - `/worker-config mode regular` switches the session back to direct work and closes the worker. Session shutdown also performs best-effort cleanup.
+1. Start Pi. The extension initializes in regular mode and loads worker defaults from `~/.pi/agent/herdr-worker.json`.
+2. The agent can enter brain mode itself with `worker_mode({ action: "brain" })`; no user slash command is required. Calling `worker_delegate` also enters brain mode automatically.
+3. A persistent worker starts in a dedicated Herdr tab. Delegations reuse it and are serialized.
+4. Delegate one coherent objective at a time with an explicit role: `general`, `explore`, `plan`, `impl`, `test`, `review`, or `simplify`.
+5. In brain mode, only coordination and read-only tools remain active; every other tool call is blocked.
+6. Return to direct work with `worker_mode({ action: "regular" })`, or close only the worker with `worker_mode({ action: "close" })`.
 
-Brain mode requires `HERDR_ENV=1`. Model choices are applied when the worker starts; changing the worker model or thinking level while active restarts the worker so the new settings take effect. Brain model and thinking settings apply to the current pi session.
+Manual `/worker-config` commands and the settings UI remain available for session-only overrides. Worker-model overrides must be allowed by `herdr-worker.json`; changing live worker settings restarts it.
+
+Brain mode requires `HERDR_ENV=1`. Mode itself remains session-only and resets on reload, session replacement, or restart.
 
 ## Delegating a task
 
-Use the `worker_delegate` tool with a complete task, including the relevant files, desired behavior, and validation command. The worker can inspect files, edit source, run tests, and report back. Keep one coherent implementation or validation objective per delegation.
-
-Example delegation:
+Use the `worker_delegate` tool with a role and a complete task, including relevant files, desired behavior, constraints, and validation command. The worker can inspect files, edit source when its role permits it, run tests, and report back.
 
 ```text
-Implement the worker-mode configuration command in extensions/herdr-worker.ts.
-Preserve the existing temporary /spawn commands. Run the strongest available
-TypeScript or Pi extension smoke check and report changed files and failures.
+worker_delegate({
+  role: "impl",
+  prompt: "Implement the approved behavior in extensions/herdr-worker.ts. Run the strongest available TypeScript or Pi extension smoke check and report changed files and failures."
+})
 ```
 
 ## Temporary-spawn workflow
 
-The extension also keeps `/spawn`, `/spawnp`, `/spawnlist`, `/spawnkill`, and `spawn_pi` for short-lived or independent tasks. These create a temporary pane, run one prompt, return its output, and close the pane.
-
-Temporary agents are independent of the persistent `/worker-config` worker settings. They receive a model and thinking level from the command-line helper:
+The extension also keeps `/spawn`, `/spawnp`, `/spawnlist`, `/spawnkill`, and `spawn_pi` for short-lived or independent tasks. These create a temporary tab, run one prompt, return its output, and close the tab. They use `herdr-worker.json` defaults unless explicitly overridden and do not use session-only `/worker-config` overrides.
 
 ```bash
 ~/.pi/agent/bin/herdr-worker.sh <agent-name> "<prompt>" \
@@ -54,6 +45,6 @@ Temporary agents are independent of the persistent `/worker-config` worker setti
 
 ## Safety and lifecycle
 
-The worker is scoped to the current extension/session instance. It is not persisted to disk and is closed on mode exit, reload, session replacement, or quit. Delegations use argument-safe Herdr process calls and have a default timeout of five minutes.
+The worker is scoped to the current extension/session instance. It is not persisted to disk and is closed on mode exit, reload, session replacement, or quit. Delegations are argument-safe, serialized, and use the configured timeout. Worker failures throw so Pi records a real tool error.
 
 All Herdr workflows require pi to be running inside a Herdr-managed pane (`HERDR_ENV=1`).

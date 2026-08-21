@@ -1,50 +1,47 @@
 # Herdr Worker Skill
 
-Run pi agents in isolated Herdr panes, including the persistent worker used by brain mode in its own tab.
+Run Pi agents in dedicated Herdr tabs, including the persistent worker used by brain mode and independent temporary workers.
 
 ## Quick Start
 
-After installing this package with `pi install npm:pi-herdr-worker`, Pi starts in regular mode. Configure the session-only brain/worker workflow with:
+Pi starts in regular mode. The agent can switch itself into brain mode without asking the user to type a slash command:
 
 ```text
-/worker-config show
-/worker-config mode brain
-/worker-config brain-model <provider/model>
-/worker-config brain-thinking <level>
-/worker-config worker-model <provider/model>
-/worker-config worker-thinking <level>
+worker_mode({ action: "brain" })
 ```
 
-In brain mode, the current session **changes role to the brain/orchestrator** and delegates implementation, testing, and review work through `worker_delegate`. One worker pi is spawned in a new Herdr tab and receives serialized tasks. The brain's mutation tools are blocked in this mode.
+Calling `worker_delegate` also enters brain mode automatically. Manual `/worker-config` commands remain available for interactive configuration and status.
 
-Close the worker (agent + Herdr tab) when you're done with it:
+Worker defaults are loaded from `~/.pi/agent/herdr-worker.json`; the extension applies its default model, thinking level, timeout, and allowed-model list to persistent and temporary workers.
+
+In brain mode, the current session is the orchestrator. One persistent worker Pi is spawned in a new Herdr tab and receives serialized, role-specific tasks. The brain retains only coordination and read-only tools; other calls are blocked.
+
+Delegate with an explicit role:
 
 ```text
-worker_delegate({ prompt: "Run tests and report failures", closeAfter: true })
-/worker-config close
+worker_delegate({
+  role: "impl",
+  prompt: "Implement the approved change in the listed files and run the specified tests."
+})
 ```
 
-Return to direct work with:
+Roles are `general`, `explore`, `plan`, `impl`, `test`, `review`, and `simplify`. Explore, plan, review, and simplify are instructed to remain read-only.
+
+Close the worker when done:
 
 ```text
-/worker-config mode regular
+worker_delegate({ role: "test", prompt: "Run tests and report failures", closeAfter: true })
+worker_mode({ action: "regular" })
 ```
+
+`/worker-config close` and `/worker-config mode regular` are equivalent manual controls.
 
 ## Temporary agents
 
-For an independent one-shot task, use:
-
-```text
-/spawn Run tests and report failures
-/spawnp Run the linter and fix errors
-/spawnlist
-/spawnkill pi-test-runner
-```
-
-These commands create a temporary pane, start a pi agent, wait for its response, and close the pane.
+For independent one-shot work, use `/spawn`, `/spawnp`, or `spawn_pi`. Each creates a dedicated temporary Herdr tab, starts a Pi agent with the configured defaults unless explicitly overridden, waits for its response, and closes the tab. Temporary workers share the checkout, so do not run concurrent mutations against the same files.
 
 ## Requirements
 
-- Pi must be running inside a Herdr-managed pane (`HERDR_ENV=1`)
+- Pi must run inside a Herdr-managed pane (`HERDR_ENV=1`)
 - Herdr must be installed and running
-- Requested models must be available and authenticated
+- Requested/default models must be available and authenticated

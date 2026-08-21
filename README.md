@@ -14,7 +14,20 @@ Or via git:
 pi install git:github.com/duskoide/pi-herdr-worker
 ```
 
-Pi starts in **regular mode** for every session. Brain mode is session-only: it never persists across restarts, reloads, or session switches.
+Pi starts in **regular mode** for every session. Brain mode is session-only: it never persists across restarts, reloads, or session switches. The agent can enter or leave brain mode itself with the `worker_mode` tool; users do not need to run a slash command. Calling `worker_delegate` while regular also enters brain mode automatically.
+
+Worker defaults are loaded from `~/.pi/agent/herdr-worker.json`:
+
+```json
+{
+  "defaultModel": "kiro/gpt-5-6-luna",
+  "allowedModels": ["kiro/gpt-5-6-luna"],
+  "defaultThinking": "max",
+  "defaultTimeout": 300000
+}
+```
+
+These defaults apply to persistent and temporary workers. `/worker-config` remains available for session-only overrides, and worker-model overrides are constrained by `allowedModels`.
 
 ## Brain mode
 
@@ -47,12 +60,16 @@ The one-line subcommands remain available (useful for scripting and quick tweaks
 /worker-config worker-thinking medium
 ```
 
-`/worker-config mode brain` changes the current session's role to brain and spawns the worker in a new Herdr tab. Delegations reuse that worker and are serialized so tasks cannot race over the same checkout. The brain receives an explicit orchestrator system instruction and its mutation tools (`write`, `edit`, `bash`, patching, delete, and move) are blocked. Use the `worker_delegate` tool for implementation or validation tasks. The worker returns its report to the brain, which can then decide the next delegation.
+`/worker-config mode brain` changes the current session's role to brain and spawns the worker in a new Herdr tab. The agent can do the same with `worker_mode({ action: "brain" })`, and `worker_delegate` does it automatically if needed. Delegations reuse that worker and are serialized so tasks cannot race over the same checkout. The brain receives an explicit orchestrator system instruction; only a small coordination/read-only tool allowlist remains active, and all other tool calls are blocked. Use the `role` field to select `explore`, `plan`, `impl`, `test`, `review`, `simplify`, or `general`. The worker returns its report to the brain, which can then decide the next delegation.
 
 Delegate and close the worker (agent + Herdr tab) in one step by passing `closeAfter: true`:
 
 ```text
-worker_delegate({ prompt: "Run the full test suite and report failures", closeAfter: true })
+worker_delegate({
+  role: "test",
+  prompt: "Run the full test suite and report failures",
+  closeAfter: true
+})
 ```
 
 Close the worker on demand while staying in brain mode (the next delegation spawns a fresh worker):
@@ -61,7 +78,13 @@ Close the worker on demand while staying in brain mode (the next delegation spaw
 /worker-config close
 ```
 
-Return to direct work with:
+The agent can return to direct work without asking the user to type a command:
+
+```text
+worker_mode({ action: "regular" })
+```
+
+The equivalent manual command is:
 
 ```text
 /worker-config mode regular
@@ -81,7 +104,7 @@ These commands remain available in both modes for short-lived, independent tasks
 /spawnkill pi-test-runner
 ```
 
-`spawn_pi` is also available as a tool. It is an independent one-shot agent and does not use the persistent `worker_delegate` settings from `/worker-config`; pass its `model` and `thinking` explicitly when needed:
+`spawn_pi` is also available as a tool. It is an independent one-shot agent and does not use the persistent session overrides from `/worker-config`; it does use `herdr-worker.json` defaults unless `model` or `timeout` is provided explicitly. It runs in a dedicated temporary tab.
 
 ```text
 spawn_pi({
@@ -110,10 +133,10 @@ spawn_pi({
 
 ## How temporary spawning works
 
-1. Split the current pane without taking focus.
-2. Start a fresh pi agent with the requested model/thinking settings.
+1. Create a new Herdr tab without taking focus.
+2. Start a fresh Pi agent with the configured default model/thinking settings, unless explicitly overridden.
 3. Send the prompt and wait for its response.
-4. Read the response and close the temporary pane.
+4. Read the response and close the temporary tab.
 
 ## License
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# herdr-worker.sh - Spawn a pi agent in a new Herdr pane
+# herdr-worker.sh - Spawn a pi agent in a new Herdr tab
 #
 # Usage: herdr-worker.sh <agent-name> <prompt> [--model <model>] [--thinking <level>] [--timeout <ms>]
 #
@@ -20,10 +20,18 @@ fi
 AGENT_NAME="${1:?Usage: herdr-worker.sh <agent-name> <prompt> [--model <model>] [--thinking <level>] [--timeout <ms>]}"
 PROMPT="${2:?Usage: herdr-worker.sh <agent-name> <prompt> [--model <model>] [--thinking <level>] [--timeout <ms>]}"
 
-# Parse optional arguments
+# Parse optional arguments. Defaults come from the same portable config used by
+# the extension; explicit CLI flags override them.
+CONFIG_PATH="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/herdr-worker.json"
 MODEL=""
 THINKING=""
-TIMEOUT="120000"
+TIMEOUT=""
+if [[ -f "$CONFIG_PATH" ]]; then
+  MODEL=$(jq -r '.defaultModel // empty' "$CONFIG_PATH")
+  THINKING=$(jq -r '.defaultThinking // empty' "$CONFIG_PATH")
+  TIMEOUT=$(jq -r '.defaultTimeout // empty' "$CONFIG_PATH")
+fi
+TIMEOUT="${TIMEOUT:-120000}"
 shift 2 || true
 
 while [[ $# -gt 0 ]]; do
@@ -54,27 +62,31 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Enforce the configured model allowlist when present.
+if [[ -n "$MODEL" && -f "$CONFIG_PATH" ]]; then
+  if ! jq -e --arg model "$MODEL" '
+    (.allowedModels // []) as $allowed |
+    ($allowed | length) == 0 or
+    any($allowed[]; . == $model or . == ($model | split("/")[-1]) or endswith("/" + ($model | split("/")[-1])))
+  ' "$CONFIG_PATH" >/dev/null; then
+    echo "Error: model is not allowed by $CONFIG_PATH: $MODEL" >&2
+    exit 1
+  fi
+fi
+
 # Validate agent name (lowercase, hyphens, max 31 chars)
 if [[ ! "$AGENT_NAME" =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; then
   echo "Error: Agent name must be lowercase letters, numbers, hyphens; max 31 chars" >&2
   exit 1
 fi
 
-# Get current pane context
-CURRENT_PANE=$(herdr pane current --current)
-PANE_ID=$(echo "$CURRENT_PANE" | jq -r '.result.pane.pane_id')
+# Create a dedicated temporary tab without taking focus.
+CREATED=$(herdr tab create --cwd "$PWD" --label "$AGENT_NAME" --no-focus)
+TAB_ID=$(echo "$CREATED" | jq -r '.result.tab.tab_id')
+NEW_PANE_ID=$(echo "$CREATED" | jq -r '.result.root_pane.pane_id')
 
-if [[ -z "$PANE_ID" ]]; then
-  echo "Error: Could not get current pane ID" >&2
-  exit 1
-fi
-
-# Create new pane
-NEW_PANE=$(herdr pane split --current --direction right --cwd "$PWD" --no-focus)
-NEW_PANE_ID=$(echo "$NEW_PANE" | jq -r '.result.pane.pane_id')
-
-if [[ -z "$NEW_PANE_ID" ]]; then
-  echo "Error: Could not create new pane" >&2
+if [[ -z "$TAB_ID" || "$TAB_ID" == "null" || -z "$NEW_PANE_ID" || "$NEW_PANE_ID" == "null" ]]; then
+  echo "Error: Could not create new worker tab" >&2
   exit 1
 fi
 
@@ -111,6 +123,7 @@ RESPONSE=$(herdr agent read "$AGENT_NAME" --source recent-unwrapped --lines 100)
 # Output results
 cat <<EOF
 {
+  "tab_id": "$TAB_ID",
   "pane_id": "$NEW_PANE_ID",
   "agent_name": "$AGENT_NAME",
   "model": "${MODEL:-parent}",
@@ -120,5 +133,5 @@ cat <<EOF
 }
 EOF
 
-# Cleanup: Close the pane (this also stops the agent)
-herdr pane close "$NEW_PANE_ID" > /dev/null 2>&1 || true
+# Cleanup: close the tab (this also stops the agent).
+herdr tab close "$TAB_ID" > /dev/null 2>&1 || true
