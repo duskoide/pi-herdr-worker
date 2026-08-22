@@ -82,6 +82,13 @@ type WorkerHandle = {
   name: string;
   paneId: string;
   tabId?: string;
+  workspaceId: string;
+};
+
+type HerdrCallerContext = {
+  paneId: string;
+  tabId: string;
+  workspaceId: string;
 };
 
 type WorkerConfig = {
@@ -222,6 +229,51 @@ function parseJson<T>(output: string): T {
   return JSON.parse(output) as T;
 }
 
+async function getHerdrCallerContext(): Promise<HerdrCallerContext> {
+  const current = parseJson<{
+    result?: {
+      pane?: {
+        pane_id?: string;
+        tab_id?: string;
+        workspace_id?: string;
+      };
+    };
+  }>(await runHerdrAsync(["pane", "current", "--current"]));
+  const paneId = current.result?.pane?.pane_id;
+  const tabId = current.result?.pane?.tab_id;
+  const workspaceId = current.result?.pane?.workspace_id;
+  if (!paneId || !tabId || !workspaceId) {
+    throw new Error("Could not resolve the calling Herdr pane's workspace.");
+  }
+  return { paneId, tabId, workspaceId };
+}
+
+function assertWorkerWorkspace(
+  expectedWorkspaceId: string,
+  tabId: string,
+  paneId: string,
+  returnedWorkspaceIds: Array<string | undefined>,
+): void {
+  const ids = [tabId, paneId, ...returnedWorkspaceIds].filter((value): value is string => Boolean(value));
+  if (!ids.length || ids.some((value) => !value.startsWith(`${expectedWorkspaceId}:`) && value !== expectedWorkspaceId)) {
+    throw new Error(
+      `Herdr created worker resources outside workspace ${expectedWorkspaceId}: ${ids.join(", ") || "unknown resources"}`,
+    );
+  }
+}
+
+async function workerIsLiveInWorkspace(worker: WorkerHandle, expectedWorkspaceId: string): Promise<boolean> {
+  if (worker.workspaceId !== expectedWorkspaceId || !worker.paneId.startsWith(`${expectedWorkspaceId}:`)) return false;
+  try {
+    const current = parseJson<{ result?: { agent?: { pane_id?: string } } }>(
+      await runHerdrAsync(["agent", "get", worker.paneId], 5000),
+    );
+    return current.result?.agent?.pane_id === worker.paneId;
+  } catch {
+    return false;
+  }
+}
+
 function currentModelId(ctx: ExtensionContext): string | undefined {
   return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
@@ -233,7 +285,7 @@ function describeConfig(config: WorkerConfig, worker: WorkerHandle | undefined, 
     `brain thinking: ${config.brainThinking ?? ctx.thinkingLevel ?? "current"}`,
     `worker model: ${config.workerModel ?? config.brainModel ?? currentModelId(ctx) ?? "parent model"}`,
     `worker thinking: ${config.workerThinking ?? config.brainThinking ?? ctx.thinkingLevel ?? "parent level"}`,
-    `worker: ${worker ? `${worker.name} (${worker.paneId})` : "not running"}`,
+    `worker: ${worker ? `${worker.name} (${worker.paneId}, workspace ${worker.workspaceId})` : "not running"}`,
     "",
     "Run /worker-config with no arguments to open the interactive settings UI, or use:",
     "/worker-config mode regular|brain",
@@ -332,23 +384,46 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     if (process.env.HERDR_ENV !== "1") {
       throw new Error("Brain mode requires pi to run inside a Herdr-managed pane (HERDR_ENV=1).");
     }
-    if (worker) return worker;
+    const caller = await getHerdrCallerContext();
+    if (worker && await workerIsLiveInWorkspace(worker, caller.workspaceId)) return worker;
+    if (worker) await stopWorker(ctx);
 
     const name = `pi-worker-${Date.now().toString(36)}`;
     const created = parseJson<{
       result?: {
-        tab?: { tab_id?: string };
-        root_pane?: { pane_id?: string };
+        tab?: { tab_id?: string; workspace_id?: string };
+        root_pane?: { pane_id?: string; workspace_id?: string };
       };
-    }>(await runHerdrAsync(["tab", "create", "--cwd", ctx.cwd, "--label", name, "--no-focus"]));
+    }>(
+      await runHerdrAsync([
+        "tab",
+        "create",
+        "--workspace",
+        caller.workspaceId,
+        "--cwd",
+        ctx.cwd,
+        "--label",
+        name,
+        "--no-focus",
+      ]),
+    );
     const tabId = created.result?.tab?.tab_id;
     const paneId = created.result?.root_pane?.pane_id;
     if (!tabId || !paneId) throw new Error("Could not create a Herdr worker tab.");
+    try {
+      assertWorkerWorkspace(caller.workspaceId, tabId, paneId, [
+        created.result?.tab?.workspace_id,
+        created.result?.root_pane?.workspace_id,
+      ]);
+    } catch (error) {
+      await closeWorkerAsync({ name, paneId, tabId, workspaceId: caller.workspaceId });
+      throw error;
+    }
     const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
     const model = modelArgument(ctx, config);
     const thinking = config.workerThinking ?? config.brainThinking ?? ctx.thinkingLevel;
     if (model && !workerModelAllowed(model)) {
-      await closeWorkerAsync({ name, paneId, tabId });
+      await closeWorkerAsync({ name, paneId, tabId, workspaceId: caller.workspaceId });
       throw new Error(`Worker model is not allowed by herdr-worker.json: ${model}`);
     }
     if (model) startArgs.push("--model", model);
@@ -358,14 +433,14 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     try {
       await waitForShell(startArgs, paneId);
     } catch (error: any) {
-      await closeWorkerAsync({ name, paneId, tabId });
+      await closeWorkerAsync({ name, paneId, tabId, workspaceId: caller.workspaceId });
       const detail = String(error?.message ?? error ?? "");
       throw new Error(
         `Could not start worker ${name} with model ${model ?? "default"} and thinking ${thinking ?? "default"}: ${detail}`,
       );
     }
 
-    worker = { name, paneId, tabId };
+    worker = { name, paneId, tabId, workspaceId: caller.workspaceId };
     applyStatus(ctx, config, worker);
     return worker;
   };
@@ -404,15 +479,15 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       ].join("\n");
       onUpdate?.({
         content: [{ type: "text", text: `Worker ${active.name} is running the ${role} delegation…` }],
-        details: { worker: active.name, role, state: "working" },
+        details: { worker: active.name, workspace: active.workspaceId, role, state: "working" },
       });
       const interruptWorker = () => {
-        void runHerdrAsync(["agent", "send-keys", active.name, "ctrl+c"], 5000).catch(() => undefined);
+        void runHerdrAsync(["agent", "send-keys", active.paneId, "ctrl+c"], 5000).catch(() => undefined);
       };
       signal?.addEventListener("abort", interruptWorker, { once: true });
       try {
         await runHerdrAsync(
-          ["agent", "prompt", active.name, rolePrompt, "--wait", "--timeout", String(timeout)],
+          ["agent", "prompt", active.paneId, rolePrompt, "--wait", "--timeout", String(timeout)],
           timeout + 30000,
           signal,
         );
@@ -422,10 +497,10 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       if (signal?.aborted) throw new Error("Worker delegation cancelled.");
       onUpdate?.({
         content: [{ type: "text", text: `Worker ${active.name} finished; collecting its final report…` }],
-        details: { worker: active.name, role, state: "collecting" },
+        details: { worker: active.name, workspace: active.workspaceId, role, state: "collecting" },
       });
       const transcript = await runHerdrAsync(
-        ["agent", "read", active.name, "--source", "recent-unwrapped", "--lines", "120"],
+        ["agent", "read", active.paneId, "--source", "recent-unwrapped", "--lines", "120"],
         30000,
         signal,
       );
@@ -1030,9 +1105,10 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       if (process.env.HERDR_ENV !== "1") return notify(ctx, "Not running in Herdr environment.", "error");
       try {
+        const caller = await getHerdrCallerContext();
         const parsed = parseJson<{ result?: { agents?: Array<{ name: string; agent_status: string; pane_id: string }> } }>(runHerdr(["agent", "list"]));
-        const agents = parsed.result?.agents ?? [];
-        notify(ctx, agents.length ? agents.map((agent) => `- ${agent.name} (${agent.agent_status}) in ${agent.pane_id}`).join("\n") : "No agents currently running.");
+        const agents = (parsed.result?.agents ?? []).filter((agent) => agent.pane_id.startsWith(`${caller.workspaceId}:`));
+        notify(ctx, agents.length ? agents.map((agent) => `- ${agent.name} (${agent.agent_status}) in ${agent.pane_id}`).join("\n") : `No agents running in workspace ${caller.workspaceId}.`);
       } catch (error: any) {
         notify(ctx, `Failed: ${error.message}`, "error");
       }
@@ -1045,12 +1121,19 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       const name = args.trim();
       if (!name) return notify(ctx, "Usage: /spawnkill <agent-name>", "error");
       try {
+        const caller = await getHerdrCallerContext();
         const parsed = parseJson<{ result?: { agent?: { pane_id?: string } } }>(runHerdr(["agent", "get", name]));
         const paneId = parsed.result?.agent?.pane_id;
         if (!paneId) throw new Error(`Agent not found: ${name}`);
-        closeWorker({ name, paneId });
-        if (worker?.name === name) worker = undefined;
-        notify(ctx, `Killed agent ${name}.`);
+        if (!paneId.startsWith(`${caller.workspaceId}:`)) {
+          throw new Error(`Agent ${name} is outside the calling workspace ${caller.workspaceId}.`);
+        }
+        if (worker?.name === name && worker.paneId === paneId) {
+          await stopWorker(ctx);
+        } else {
+          await runHerdrAsync(["pane", "close", paneId]);
+        }
+        notify(ctx, `Killed agent ${name} in workspace ${caller.workspaceId}.`);
       } catch (error: any) {
         notify(ctx, `Failed: ${error.message}`, "error");
       }
@@ -1130,20 +1213,42 @@ async function runOneShot(
   if (process.env.HERDR_ENV !== "1") throw new Error("Not running in Herdr environment. Cannot spawn worker tab.");
   let paneId: string | undefined;
   let tabId: string | undefined;
+  let workspaceId: string | undefined;
   try {
-    const created = parseJson<{ result?: { tab?: { tab_id?: string }; root_pane?: { pane_id?: string } } }>(
-      runHerdr(["tab", "create", "--cwd", cwd, "--label", name, "--no-focus"]),
+    const caller = await getHerdrCallerContext();
+    workspaceId = caller.workspaceId;
+    const created = parseJson<{
+      result?: {
+        tab?: { tab_id?: string; workspace_id?: string };
+        root_pane?: { pane_id?: string; workspace_id?: string };
+      };
+    }>(
+      await runHerdrAsync([
+        "tab",
+        "create",
+        "--workspace",
+        workspaceId,
+        "--cwd",
+        cwd,
+        "--label",
+        name,
+        "--no-focus",
+      ]),
     );
     tabId = created.result?.tab?.tab_id;
     paneId = created.result?.root_pane?.pane_id;
     if (!tabId || !paneId) throw new Error("Could not create new worker tab");
+    assertWorkerWorkspace(workspaceId, tabId, paneId, [
+      created.result?.tab?.workspace_id,
+      created.result?.root_pane?.workspace_id,
+    ]);
     const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
     if (model) startArgs.push("--model", model);
     if (thinking) startArgs.push("--thinking", thinking);
     await waitForShell(startArgs, paneId);
-    runHerdr(["agent", "prompt", name, prompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
-    const response = runHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "100"]);
-    return `Agent ${name} completed in tab ${tabId}\n\n${response}`;
+    runHerdr(["agent", "prompt", paneId, prompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
+    const response = runHerdr(["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", "100"]);
+    return `Agent ${name} completed in workspace ${workspaceId}, tab ${tabId}\n\n${response}`;
   } finally {
     if (tabId) {
       try { runHerdr(["tab", "close", tabId]); } catch { /* best effort cleanup */ }

@@ -80,13 +80,29 @@ if [[ ! "$AGENT_NAME" =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; then
   exit 1
 fi
 
-# Create a dedicated temporary tab without taking focus.
-CREATED=$(herdr tab create --cwd "$PWD" --label "$AGENT_NAME" --no-focus)
+# Resolve the calling pane's workspace explicitly. Without --workspace, Herdr
+# may create the tab in whichever workspace the UI currently has focused.
+CURRENT=$(herdr pane current --current)
+WORKSPACE_ID=$(echo "$CURRENT" | jq -r '.result.pane.workspace_id')
+if [[ -z "$WORKSPACE_ID" || "$WORKSPACE_ID" == "null" ]]; then
+  echo "Error: Could not resolve the calling Herdr workspace" >&2
+  exit 1
+fi
+
+# Create a dedicated temporary tab in the calling workspace without taking focus.
+CREATED=$(herdr tab create --workspace "$WORKSPACE_ID" --cwd "$PWD" --label "$AGENT_NAME" --no-focus)
 TAB_ID=$(echo "$CREATED" | jq -r '.result.tab.tab_id')
+TAB_WORKSPACE_ID=$(echo "$CREATED" | jq -r '.result.tab.workspace_id')
 NEW_PANE_ID=$(echo "$CREATED" | jq -r '.result.root_pane.pane_id')
+PANE_WORKSPACE_ID=$(echo "$CREATED" | jq -r '.result.root_pane.workspace_id')
 
 if [[ -z "$TAB_ID" || "$TAB_ID" == "null" || -z "$NEW_PANE_ID" || "$NEW_PANE_ID" == "null" ]]; then
   echo "Error: Could not create new worker tab" >&2
+  exit 1
+fi
+if [[ "$TAB_WORKSPACE_ID" != "$WORKSPACE_ID" || "$PANE_WORKSPACE_ID" != "$WORKSPACE_ID" || "$TAB_ID" != "$WORKSPACE_ID":* || "$NEW_PANE_ID" != "$WORKSPACE_ID":* ]]; then
+  herdr tab close "$TAB_ID" >/dev/null 2>&1 || true
+  echo "Error: Worker tab escaped calling workspace $WORKSPACE_ID" >&2
   exit 1
 fi
 
@@ -109,7 +125,7 @@ if [[ "$AGENT_STATUS" == "unknown" ]]; then
 fi
 
 # Send prompt
-PROMPT_RESULT=$(herdr agent prompt "$AGENT_NAME" "$PROMPT" --wait --timeout "$TIMEOUT")
+PROMPT_RESULT=$(herdr agent prompt "$NEW_PANE_ID" "$PROMPT" --wait --timeout "$TIMEOUT")
 PROMPT_STATUS=$(echo "$PROMPT_RESULT" | jq -r '.type')
 
 if [[ "$PROMPT_STATUS" != "agent_prompted" ]]; then
@@ -118,11 +134,12 @@ if [[ "$PROMPT_STATUS" != "agent_prompted" ]]; then
 fi
 
 # Read response
-RESPONSE=$(herdr agent read "$AGENT_NAME" --source recent-unwrapped --lines 100)
+RESPONSE=$(herdr agent read "$NEW_PANE_ID" --source recent-unwrapped --lines 100)
 
 # Output results
 cat <<EOF
 {
+  "workspace_id": "$WORKSPACE_ID",
   "tab_id": "$TAB_ID",
   "pane_id": "$NEW_PANE_ID",
   "agent_name": "$AGENT_NAME",

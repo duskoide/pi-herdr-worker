@@ -14,7 +14,7 @@ Calling `worker_delegate` also enters brain mode automatically. Manual `/worker-
 
 Worker defaults are loaded from `~/.pi/agent/herdr-worker.json`; the extension applies its default model, thinking level, timeout, and allowed-model list to persistent and temporary workers.
 
-In brain mode, the current session is the orchestrator. One persistent worker Pi is spawned in a new Herdr tab and receives serialized, role-specific tasks. The brain retains only coordination and read-only tools; other calls are blocked.
+In brain mode, the current session is the orchestrator. One persistent worker Pi is spawned in a new Herdr tab in the brain pane's exact workspace and receives serialized, role-specific tasks. If the brain moves workspaces, the old worker is replaced in the new workspace. Delegations target its workspace-qualified pane ID. The brain retains only coordination and read-only tools; other calls are blocked.
 
 Delegate with an explicit role:
 
@@ -38,7 +38,7 @@ worker_mode({ action: "regular" })
 
 ## Temporary agents
 
-For independent one-shot work, use `/spawn`, `/spawnp`, or `spawn_pi`. Each creates a dedicated temporary Herdr tab, starts a Pi agent with the configured defaults unless explicitly overridden, waits for its response, and closes the tab. Temporary workers share the checkout, so do not run concurrent mutations against the same files.
+For independent one-shot work, use `/spawn`, `/spawnp`, or `spawn_pi`. Each creates a dedicated temporary Herdr tab in the caller's exact workspace, starts a Pi agent with the configured defaults unless explicitly overridden, waits for its response, and closes the tab. Temporary workers share the checkout, so do not run concurrent mutations against the same files.
 
 ## Requirements
 

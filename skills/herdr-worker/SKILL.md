@@ -14,7 +14,7 @@ This extension supports two session-only modes:
 
 1. Start Pi. The extension initializes in regular mode and loads worker defaults from `~/.pi/agent/herdr-worker.json`.
 2. The agent can enter brain mode itself with `worker_mode({ action: "brain" })`; no user slash command is required. Calling `worker_delegate` also enters brain mode automatically.
-3. A persistent worker starts in a dedicated Herdr tab. Delegations reuse it and are serialized.
+3. A persistent worker starts in a dedicated Herdr tab created with the calling brain pane's exact workspace ID. Delegations target its workspace-qualified pane ID. If the brain moves workspaces, the old worker is replaced in the new workspace. Delegations reuse it and are serialized.
 4. Delegate one coherent objective at a time with an explicit role: `general`, `explore`, `plan`, `impl`, `test`, `review`, or `simplify`.
 5. In brain mode, only coordination and read-only tools remain active; every other tool call is blocked.
 6. Return to direct work with `worker_mode({ action: "regular" })`, or close only the worker with `worker_mode({ action: "close" })`.
@@ -36,7 +36,7 @@ worker_delegate({
 
 ## Temporary-spawn workflow
 
-The extension also keeps `/spawn`, `/spawnp`, `/spawnlist`, `/spawnkill`, and `spawn_pi` for short-lived or independent tasks. These create a temporary tab, run one prompt, return its output, and close the tab. They use `herdr-worker.json` defaults unless explicitly overridden and do not use session-only `/worker-config` overrides.
+The extension also keeps `/spawn`, `/spawnp`, `/spawnlist`, `/spawnkill`, and `spawn_pi` for short-lived or independent tasks. These explicitly resolve the caller's current workspace, create a temporary tab there, run one prompt, return its output, and close the tab. They use `herdr-worker.json` defaults unless explicitly overridden and do not use session-only `/worker-config` overrides.
 
 ```bash
 ~/.pi/agent/bin/herdr-worker.sh <agent-name> "<prompt>" \
