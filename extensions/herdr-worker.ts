@@ -144,9 +144,12 @@ const WORKER_SYSTEM_PROMPT = [
   "The parent reads only your most recent output, so make the final message self-contained.",
 ].join(" ");
 
-// Marker phrase the orchestrator injects into every subagent's system prompt.
 // pi gives spawned processes no dedicated env var, so a worker recognises
-// itself by finding this text in its own argv.
+// itself by finding marker text in its own argv. The marker lives in the
+// value of --append-system-prompt, which pi carries in process.argv (a
+// dedicated --flag is unusable: pi rejects unknown options and would abort
+// the subagent before the extension loads).
+const MARKER_LINE = "You are a one-time implementation subagent spawned by a parent pi session.";
 const SPAWN_MARKER = "one-time implementation subagent";
 
 function detectWorkerInstance(): boolean {
@@ -272,7 +275,11 @@ function resolveRole(ctx: ExtensionContext, requested: string | undefined): { ro
 }
 
 function roleSystemPrompt(role: RoleDef): string {
-  if (role.promptMode === "replace") return role.prompt;
+  // The marker sentence is always injected, even for prompt_mode: replace, so
+  // the subagent reliably recognises itself as a worker (IS_WORKER_INSTANCE
+  // scans its own argv for this text). A role body alone would otherwise let a
+  // replace-mode role run as if it were the brain session.
+  if (role.promptMode === "replace") return `${MARKER_LINE}\n\n${role.prompt}`;
   return `${WORKER_SYSTEM_PROMPT}\n\n${role.prompt}`;
 }
 
