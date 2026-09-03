@@ -1,6 +1,6 @@
 # pi-herdr-worker
 
-Spawn pi agents in isolated Herdr panes, or run pi as an orchestrator that delegates implementation work to fresh, one-shot subagents.
+Spawn pi agents in isolated Herdr panes — one-shot delegations in their own tabs, or temporary agents in split panes.
 
 ## Installation
 
@@ -14,51 +14,57 @@ Or via git:
 pi install git:github.com/duskoide/pi-herdr-worker
 ```
 
-Pi starts in **regular mode** for every session. Brain mode is session-only: it never persists across restarts, reloads, or session switches.
+The extension adds two always-available tools for delegating work to pi subagents that run in Herdr-managed panes:
 
-## Brain mode
+- **`worker_delegate`** — spawn a fresh one-shot pi subagent in its own Herdr tab. Best for implementation, testing, and review work that benefits from a clean context window. Multiple disjoint-path delegations run concurrently (up to `max-concurrent`).
+- **`spawn_pi`** — spawn a temporary pi agent in a split pane. Best for short-lived, independent tasks that don't need a coordinated plan.
 
-Brain mode switches the **current session into the brain (orchestrator) role**. Instead of a reusable worker, every delegation spawns a **fresh, one-shot subagent** that completes the task, returns its report, and is closed. This gives each task a clean context and guarantees no cross-task state leaks.
-
-- **Brain** — the current pi session, after it changes role. It plans, delegates, inspects results, and reports to the user. It does not do implementation work itself.
-- **Subagent** — a fresh pi spawned in a new Herdr tab for a single delegated task. It runs to completion, returns its report, and the tab is closed. It has no memory of this conversation, so delegation prompts must be self-contained.
-
-Enable and configure it with the interactive settings UI or one-line subcommands.
-
-Run `/worker-config` with no arguments to open the settings UI — an interactive panel where you can:
-
-- Toggle **Mode** between `regular` and `brain` (Enter cycles).
-- Pick the **Brain model** and **Subagent model** from a searchable list of available models (Enter opens the picker; start typing to filter by name, backspace to edit; the subagent model can inherit the brain model).
-- Set the **Brain thinking** and **Subagent thinking** levels from a picker.
-- Pick the **Default role** — the persona applied when `worker_delegate` omits `role`.
-- Set **Max concurrent** — the upper bound on subagents running at once.
-- **Reset overrides** back to inheriting the current session's model/thinking.
-
-The panel edits a **draft** — nothing is applied while you navigate. A status line shows `● unsaved changes` once you edit anything. Press **Ctrl+S** to save: the extension then switches the session model/mode. Press **Esc** to discard the draft and close without changes. Use ↑↓ to navigate and Enter to cycle or open a picker.
-
-The one-line subcommands remain available (useful for scripting and quick tweaks; these apply immediately):
+At session start the extension injects a concise `worker_delegate` / `spawn_pi` primer into the system prompt so the orchestrator knows when to delegate — without first having to read the skill.
 
 ```text
-/worker-config              # open the settings UI
-/worker-config ui           # open the settings UI
-/worker-config show
-/worker-config mode brain
-/worker-config default-role reviewer
-/worker-config max-concurrent 4
-/worker-config roles
-/worker-config brain-model anthropic/claude-sonnet-4-5
-/worker-config brain-thinking high
-/worker-config worker-model openai/gpt-4o
-/worker-config worker-thinking medium
+worker_delegate({
+  prompt: "Implement the API and tests",
+  paths: ["src/api.ts", "tests/api.test.ts"],
+})
+
+worker_delegate({
+  prompt: "Review the auth module",
+  role: "reviewer",
+})
+
+spawn_pi({ prompt: "Run npm test and report failures" })
 ```
 
-`/worker-config mode brain` changes the current session's role to brain. The brain receives an explicit orchestrator system instruction and its mutation tools (`write`, `edit`, `bash`, patching, delete, and move) are blocked. Use the `worker_delegate` tool for implementation or validation tasks; each call spawns a one-shot subagent whose report comes back to the brain.
+## Requirements
 
-Worker model/thinking overrides and the default role persist in the global Pi `settings.json` under `herdrWorker`; inherited values remain omitted. Brain/regular mode is never persisted and every new session starts in regular mode.
+- Pi must be running inside a Herdr-managed pane (`HERDR_ENV=1`)
+- Herdr must be installed and running
+- The requested models must be available and authenticated in Pi
+
+## Delegating work
+
+`worker_delegate` accepts a `paths` array — files or directories the task may modify. Use repository-relative paths.
+
+- Tasks with **disjoint** `paths` may execute concurrently on separate subagents, up to `max-concurrent`.
+- Tasks with **overlapping** `paths`, and tasks without `paths`, wait for conflicting work to finish.
+- Treat shared configuration, lockfiles, generated files, and broad test/build commands as exclusive by omitting `paths`.
+
+```text
+worker_delegate({
+  prompt: "Implement the API and tests",
+  paths: ["src/api.ts", "tests/api.test.ts"],
+})
+
+worker_delegate({
+  prompt: "Run the full test suite and report failures",
+})
+```
+
+Every delegation spawns a subagent, waits for its report, and closes the tab. Each call is a complete handoff: prompts must be self-contained — subagents have no memory of this conversation.
 
 ## Roles
 
-A **role** is a persona — a custom system prompt (plus optional model, thinking level, and tool allowlist) for a spawned subagent. Roles are defined as pi-style agent markdown files, so they double as native subagent types if you also use a subagent extension.
+A **role** is a persona — a custom system prompt (and optional `model`, `thinking`, and `tools`) for a spawned subagent. Roles are defined as pi-style agent markdown files, so they double as native subagent types if you also use a subagent extension.
 
 Discovery order (later entries override earlier ones):
 
@@ -94,8 +100,6 @@ Supported frontmatter fields:
 | `prompt_mode` | `replace` (default): body is the subagent's system prompt. `append`: body is appended to the built-in worker preamble |
 | `enabled` | `false` disables the role |
 
-The role name is used as the subagent's session name, so spawned tabs are easy to identify in Herdr.
-
 Pick a role per delegation, or set a default:
 
 ```text
@@ -106,36 +110,29 @@ worker_delegate({ prompt: "Review the auth module", role: "reviewer" })
 
 An unknown role falls back to the built-in generic worker with a warning rather than failing the task.
 
-## Delegating work
+## Configuration
 
-`worker_delegate` accepts an optional `paths` array. Use repository-relative paths (or directories) for files the task may modify:
+The interactive settings UI is opened with `/worker-config` (no arguments). Pick the subagent model and thinking level (with an inherit-from-parent option), pick the default role, set `max-concurrent`, and reset all overrides. The panel edits a draft; press **Ctrl+S** to save and **Esc** to discard. Use ↑↓ to navigate and Enter to cycle or open a picker.
 
-```text
-worker_delegate({
-  prompt: "Implement the API and tests",
-  paths: ["src/api.ts", "tests/api.test.ts"]
-})
-```
-
-Tasks with disjoint `paths` may execute concurrently on separate subagents, up to `max-concurrent`. Tasks with overlapping paths, and tasks without `paths`, wait for conflicting work to finish. Treat shared configuration, lockfiles, generated files, and broad test/build commands as exclusive by omitting `paths`.
-
-Each delegation spawns a subagent, waits for its report, and closes the tab:
+The one-line subcommands remain available (useful for scripting and quick tweaks; these apply immediately):
 
 ```text
-worker_delegate({ prompt: "Run the full test suite and report failures" })
+/worker-config                   # open the settings UI
+/worker-config ui                # open the settings UI
+/worker-config show
+/worker-config default-role <role>
+/worker-config max-concurrent <n>
+/worker-config roles
+/worker-config worker-model <provider/model>
+/worker-config worker-thinking <off|minimal|low|medium|high|xhigh|max>
+/worker-config reset
 ```
 
-Return to direct work with:
-
-```text
-/worker-config mode regular
-```
-
-Active subagents run to completion even after switching to regular mode; their tabs close when each task finishes. On session shutdown, owned subagent tabs are closed and queued delegations are rejected.
+Worker model/thinking overrides and the default role persist in the global Pi `settings.json` under `herdrWorker`; inherited values remain omitted.
 
 ## Temporary spawn commands
 
-These commands remain available in both modes for short-lived, independent tasks:
+For an independent one-shot task outside a coordinated plan, use the slash commands:
 
 ```text
 /spawn Run tests and report failures --role reviewer
@@ -154,7 +151,7 @@ spawn_pi({
   role: "reviewer",
   model: "gpt-4o",
   timeout: 180000,
-  direction: "right"
+  direction: "right",
 })
 ```
 
@@ -167,13 +164,7 @@ spawn_pi({
   --model openai/gpt-4o --role reviewer --timeout 180000
 ```
 
-## Requirements
-
-- Pi must be running inside a Herdr-managed pane (`HERDR_ENV=1`)
-- Herdr must be installed and running
-- The requested models must be available and authenticated in Pi
-
-## How temporary spawning works
+## How spawning works
 
 1. Split the current pane without taking focus (or spawn a subagent in a new tab for a delegated task).
 2. Start a fresh pi agent with the requested model/thinking/role settings.

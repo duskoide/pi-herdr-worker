@@ -22,32 +22,17 @@ import {
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-type Mode = "regular" | "brain";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
-const THINKING_ORDER: ThinkingLevel[] = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-];
+const THINKING_ORDER: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(THINKING_ORDER);
 
 const CONCURRENT_CHOICES = ["1", "2", "3", "4", "6", "8"];
 
-const MUTATING_TOOLS = new Set([
-  "write",
-  "edit",
-  "bash",
-  "apply_patch",
-  "patch",
-  "delete",
-  "move",
-]);
+// A worker instance must not orchestrate its own workers. Mutation tools stay
+// available so the worker can read, edit, and execute tests directly.
+const BLOCKED_IN_WORKER = new Set(["worker_delegate", "spawn_pi"]);
 
 const WorkerDelegateInput = Type.Object({
   prompt: Type.String({
@@ -118,9 +103,6 @@ type ActiveDelegation = {
 };
 
 type WorkerConfig = {
-  mode: Mode;
-  brainModel?: string;
-  brainThinking?: ThinkingLevel;
   workerModel?: string;
   workerThinking?: ThinkingLevel;
   /** Role used when worker_delegate omits `role`. Undefined = generic worker. */
@@ -165,14 +147,13 @@ const IS_WORKER_INSTANCE = detectWorkerInstance();
 // Everything mutable lives at module scope so the queue, tab bookkeeping, and
 // config stay reachable from every helper and from lifecycle hooks. Pi reloads
 // the module per session/reload, but because session_start re-fires on switch,
-// resetSessionState() guarantees a clean slate either way. Mode is deliberately
-// never loaded from disk: every session starts regular, while model/thinking/
-// role overrides survive through settings.json.
+// resetSessionState() guarantees a clean slate either way. Persisted worker
+// defaults (model/thinking/default role/max concurrent) survive across sessions.
 // ---------------------------------------------------------------------------
 
 const state = {
   pi: undefined as ExtensionAPI | undefined,
-  config: { mode: "regular", maxConcurrent: DEFAULT_MAX_CONCURRENT } as WorkerConfig,
+  config: { maxConcurrent: DEFAULT_MAX_CONCURRENT } as WorkerConfig,
   activeDelegations: [] as ActiveDelegation[],
   pendingDelegations: [] as DelegationJob[],
   statusContexts: new Set<ExtensionContext>(),
@@ -184,7 +165,7 @@ function resetSessionState(): void {
   state.pendingDelegations.length = 0;
   state.statusContexts.clear();
   state.roleCache = undefined;
-  state.config = { mode: "regular", ...loadPersistedConfig() };
+  state.config = { ...loadPersistedConfig() };
 }
 
 // ---------------------------------------------------------------------------
@@ -384,9 +365,6 @@ function findModel(ctx: ExtensionContext, requested: string) {
 function describeConfig(ctx: ExtensionContext): string {
   const config = state.config;
   return [
-    `mode: ${config.mode}`,
-    `brain model: ${config.brainModel ?? currentModelId(ctx) ?? "current"}`,
-    `brain thinking: ${config.brainThinking ?? ctx.thinkingLevel ?? "current"}`,
     `subagent default model: ${config.workerModel ?? currentModelId(ctx) ?? "parent model"}`,
     `subagent default thinking: ${config.workerThinking ?? ctx.thinkingLevel ?? "parent level"}`,
     `default role: ${config.defaultRole ?? `${BUILTIN_WORKER_NAME} (generic)`}`,
@@ -394,12 +372,9 @@ function describeConfig(ctx: ExtensionContext): string {
     `delegations: ${state.activeDelegations.length} active, ${state.pendingDelegations.length} queued`,
     "",
     "Run /worker-config with no arguments to open the interactive settings UI, or use:",
-    "/worker-config mode regular|brain",
     "/worker-config default-role <role>",
     "/worker-config max-concurrent <n>",
     "/worker-config roles",
-    "/worker-config brain-model <provider/model>",
-    "/worker-config brain-thinking <off|minimal|low|medium|high|xhigh|max>",
     "/worker-config worker-model <provider/model>",
     "/worker-config worker-thinking <off|minimal|low|medium|high|xhigh|max>",
   ].join("\n");
@@ -407,14 +382,12 @@ function describeConfig(ctx: ExtensionContext): string {
 
 function applyStatus(ctx: ExtensionContext) {
   const theme = ctx.ui.theme;
-  const isBrain = state.config.mode === "brain";
-  const label = theme.fg("muted", "working mode:");
-  const mode = isBrain
-    ? theme.fg("accent", theme.bold("brain"))
-    : theme.fg("success", theme.bold("regular"));
+  const label = theme.fg("muted", "herdr-worker:");
+  const ready = theme.fg("success", theme.bold("ready"));
   const active = state.activeDelegations.length;
-  const tag = isBrain && active > 0 ? ` ${theme.fg("muted", "·")} ${theme.fg("warning", `● ${active} active`)}` : "";
-  ctx.ui.setStatus("herdr-worker", `${label} ${mode}${tag}`);
+  const queued = state.pendingDelegations.length;
+  const busy = active + queued > 0 ? ` ${theme.fg("muted", "·")} ${theme.fg("warning", `● ${active} active`)}` : "";
+  ctx.ui.setStatus("herdr-worker", `${label} ${ready}${busy}`);
 }
 
 function refreshStatus() {
@@ -431,7 +404,7 @@ function refreshStatus() {
 // Persistence
 // ---------------------------------------------------------------------------
 
-type PersistedWorkerConfig = Omit<WorkerConfig, "mode">;
+type PersistedWorkerConfig = WorkerConfig;
 
 function persistedDefaults(): PersistedWorkerConfig {
   return { maxConcurrent: DEFAULT_MAX_CONCURRENT };
@@ -444,11 +417,6 @@ function loadPersistedConfig(): PersistedWorkerConfig {
     if (!value || typeof value !== "object") return persistedDefaults();
     const stored = value as Record<string, unknown>;
     return {
-      brainModel: typeof stored.brainModel === "string" ? stored.brainModel : undefined,
-      brainThinking:
-        typeof stored.brainThinking === "string" && validThinking(stored.brainThinking)
-          ? stored.brainThinking
-          : undefined,
       workerModel: typeof stored.workerModel === "string" ? stored.workerModel : undefined,
       workerThinking:
         typeof stored.workerThinking === "string" && validThinking(stored.workerThinking)
@@ -478,9 +446,14 @@ function savePersistedConfig(): void {
     if (error?.code !== "ENOENT") throw new Error(`Could not read ${path}: ${error.message}`);
   }
 
+  // Drop legacy brain-* fields so old settings.json files don't keep stale data.
+  if (settings[WORKER_SETTINGS_KEY] && typeof settings[WORKER_SETTINGS_KEY] === "object") {
+    delete (settings[WORKER_SETTINGS_KEY] as Record<string, unknown>).brainModel;
+    delete (settings[WORKER_SETTINGS_KEY] as Record<string, unknown>).brainThinking;
+  }
+
   settings[WORKER_SETTINGS_KEY] = {
-    ...(config.brainModel ? { brainModel: config.brainModel } : {}),
-    ...(config.brainThinking ? { brainThinking: config.brainThinking } : {}),
+    ...(settings[WORKER_SETTINGS_KEY] as Record<string, unknown> | undefined),
     ...(config.workerModel ? { workerModel: config.workerModel } : {}),
     ...(config.workerThinking ? { workerThinking: config.workerThinking } : {}),
     ...(config.defaultRole ? { defaultRole: config.defaultRole } : {}),
@@ -513,7 +486,7 @@ async function runDelegation(record: ActiveDelegation) {
   const config = state.config;
   try {
     if (process.env.HERDR_ENV !== "1") {
-      throw new Error("Brain mode requires pi to run inside a Herdr-managed pane (HERDR_ENV=1).");
+      throw new Error("worker_delegate requires pi to run inside a Herdr-managed pane (HERDR_ENV=1).");
     }
     const modelRequested = role.model ?? config.workerModel ?? currentModelId(ctx);
     let model = modelRequested;
@@ -581,9 +554,6 @@ function pumpDelegations() {
 }
 
 function delegate(ctx: ExtensionContext, args: WorkerDelegateArgs): Promise<string> {
-  if (state.config.mode !== "brain") {
-    return Promise.reject(new Error("Brain mode is not active. Run /worker-config mode brain first."));
-  }
   if (!args.prompt.trim()) return Promise.reject(new Error("A worker prompt is required."));
   // Resolve the role before queueing so an unknown name warns immediately.
   const { role, fellBack } = resolveRole(ctx, args.role);
@@ -607,45 +577,6 @@ function delegate(ctx: ExtensionContext, args: WorkerDelegateArgs): Promise<stri
 // ---------------------------------------------------------------------------
 // Settings mutations
 // ---------------------------------------------------------------------------
-
-async function setBrainModel(requested: string, ctx: ExtensionContext): Promise<void> {
-  const model = findModel(ctx, requested);
-  if (!model) throw new Error(`Model not found: ${requested}`);
-  if (!(await state.pi!.setModel(model))) throw new Error(`Pi could not authenticate model: ${requested}`);
-  state.config.brainModel = `${model.provider}/${model.id}`;
-  savePersistedConfig();
-}
-
-function setBrainThinking(level: ThinkingLevel): void {
-  state.pi!.setThinkingLevel(level);
-  state.config.brainThinking = level;
-  savePersistedConfig();
-}
-
-function setMode(mode: Mode, ctx: ExtensionContext): void {
-  if (mode === "brain" && process.env.HERDR_ENV !== "1") {
-    throw new Error("Brain mode requires pi to run inside a Herdr-managed pane (HERDR_ENV=1).");
-  }
-  if (mode === state.config.mode) return;
-  if (mode === "brain") {
-    state.config.mode = "brain";
-    const roles = [...discoverRoles(ctx).keys()];
-    notify(
-      ctx,
-      `Brain mode enabled. This session is now the orchestrator: plan and delegate with worker_delegate. Each delegation spawns a one-shot subagent (roles: ${roles.join(", ")}) in its own Herdr tab, reads its report, and closes the tab. Your own mutation tools are blocked.`,
-    );
-  } else {
-    state.config.mode = "regular";
-    const active = state.activeDelegations.length;
-    notify(
-      ctx,
-      active > 0
-        ? `Regular mode enabled. ${active} subagent(s) still running; their tabs close when they finish. This session works directly again.`
-        : "Regular mode enabled. This session works directly again.",
-    );
-  }
-  applyStatus(ctx);
-}
 
 // Worker model/thinking are defaults for future spawns; there is no live
 // worker to restart, so a change only needs to be recorded.
@@ -726,17 +657,18 @@ function searchableSelect(
 }
 
 // Build a SelectList submenu factory for picking a model from the registry.
-function modelSubmenu(ctx: ExtensionContext, includeInherit: boolean) {
+// The first option lets the user clear the override and inherit the parent
+// session's model.
+function modelSubmenu(ctx: ExtensionContext) {
   return (current: string, done: (selected?: string) => void): Component => {
     const available = ctx.modelRegistry.getAvailable();
-    const items: SelectItem[] = [];
-    if (includeInherit) {
-      items.push({
+    const items: SelectItem[] = [
+      {
         value: "__inherit__",
-        label: "(inherit brain model)",
-        description: "Use the same model as the brain session",
-      });
-    }
+        label: "(inherit parent model)",
+        description: "Use the same model as this session",
+      },
+    ];
     for (const model of available) {
       const id = `${model.provider}/${model.id}`;
       items.push({ value: id, label: id, description: model.provider });
@@ -746,18 +678,19 @@ function modelSubmenu(ctx: ExtensionContext, includeInherit: boolean) {
   };
 }
 
-// Build a SelectList submenu factory for picking a thinking level.
-function thinkingSubmenu(includeInherit: boolean) {
+// Build a SelectList submenu factory for picking a thinking level. The first
+// option lets the user clear the override and inherit the parent session's
+// thinking level.
+function thinkingSubmenu() {
   return (current: string, done: (selected?: string) => void): Component => {
-    const items: SelectItem[] = [];
-    if (includeInherit) {
-      items.push({
+    const items: SelectItem[] = [
+      {
         value: "__inherit__",
-        label: "(inherit brain level)",
-        description: "Use the same thinking level as the brain session",
-      });
-    }
-    for (const level of THINKING_ORDER) items.push({ value: level, label: level });
+        label: "(inherit parent thinking)",
+        description: "Use the same thinking level as this session",
+      },
+      ...THINKING_ORDER.map((level) => ({ value: level, label: level })),
+    ];
 
     const list = new SelectList(items, items.length, getSelectListTheme());
     const currentIndex = items.findIndex((item) => item.value === current);
@@ -798,55 +731,31 @@ async function openSettingsUI(ctx: ExtensionContext): Promise<void> {
   // Draft state: edits are collected here and only applied to the live config
   // when the user presses Ctrl+S. Esc discards the draft.
   type Draft = {
-    mode: Mode;
-    brainModel?: string;
-    brainThinking?: ThinkingLevel;
     workerModel?: string;
     workerThinking?: ThinkingLevel;
     defaultRole?: string;
     maxConcurrent: number;
   };
   const draft: Draft = {
-    mode: config.mode,
-    brainModel: config.brainModel,
-    brainThinking: config.brainThinking,
     workerModel: config.workerModel,
     workerThinking: config.workerThinking,
     defaultRole: config.defaultRole,
     maxConcurrent: config.maxConcurrent,
   };
 
-  const brainModelDisplay = () => draft.brainModel ?? currentModelId(ctx) ?? "current";
-  const brainThinkingDisplay = () => draft.brainThinking ?? ctx.thinkingLevel ?? "current";
-  const workerModelDisplay = () => draft.workerModel ?? "(inherit brain model)";
-  const workerThinkingDisplay = () => draft.workerThinking ?? "(inherit brain level)";
+  const workerModelDisplay = () => draft.workerModel ?? "(inherit parent model)";
+  const workerThinkingDisplay = () => draft.workerThinking ?? "(inherit parent thinking)";
   const defaultRoleDisplay = () => draft.defaultRole ?? `${BUILTIN_WORKER_NAME} (generic)`;
 
   const isDirty = () =>
-    draft.mode !== config.mode ||
-    draft.brainModel !== config.brainModel ||
-    draft.brainThinking !== config.brainThinking ||
     draft.workerModel !== config.workerModel ||
     draft.workerThinking !== config.workerThinking ||
     draft.defaultRole !== config.defaultRole ||
     draft.maxConcurrent !== config.maxConcurrent;
 
   // Apply the draft to the live config. Subagent defaults only affect future
-  // spawns, so there is nothing to restart; mode may still need its Herdr check.
+  // spawns, so there is nothing live to restart.
   const saveDraft = async () => {
-    const brainModelChanged = draft.brainModel !== config.brainModel;
-    const brainThinkingChanged = draft.brainThinking !== config.brainThinking;
-    if (brainModelChanged && draft.brainModel) {
-      await setBrainModel(draft.brainModel, ctx);
-    } else if (brainModelChanged) {
-      config.brainModel = undefined;
-    }
-    if (brainThinkingChanged && draft.brainThinking) {
-      setBrainThinking(draft.brainThinking);
-    } else if (brainThinkingChanged) {
-      config.brainThinking = undefined;
-    }
-
     if (draft.workerModel && !findModel(ctx, draft.workerModel)) {
       throw new Error(`Model not found or unavailable: ${draft.workerModel}`);
     }
@@ -855,11 +764,6 @@ async function openSettingsUI(ctx: ExtensionContext): Promise<void> {
     config.defaultRole = draft.defaultRole;
     config.maxConcurrent = draft.maxConcurrent;
     savePersistedConfig();
-
-    if (draft.mode !== config.mode) {
-      setMode(draft.mode, ctx);
-    }
-
     applyStatus(ctx);
   };
 
@@ -870,39 +774,18 @@ async function openSettingsUI(ctx: ExtensionContext): Promise<void> {
 
     const items: SettingItem[] = [
       {
-        id: "mode",
-        label: "Mode",
-        description: "regular = work directly; brain = delegate to one-shot subagents",
-        currentValue: draft.mode,
-        values: ["regular", "brain"],
-      },
-      {
-        id: "brain-model",
-        label: "Brain model",
-        description: "Model for this orchestrator session (enter to pick)",
-        currentValue: brainModelDisplay(),
-        submenu: modelSubmenu(ctx, false),
-      },
-      {
-        id: "brain-thinking",
-        label: "Brain thinking",
-        description: "Thinking level for this orchestrator session",
-        currentValue: brainThinkingDisplay(),
-        submenu: thinkingSubmenu(false),
-      },
-      {
         id: "worker-model",
         label: "Subagent model",
         description: "Default model for spawned subagents; a role file may override (enter to pick)",
         currentValue: workerModelDisplay(),
-        submenu: modelSubmenu(ctx, true),
+        submenu: modelSubmenu(ctx),
       },
       {
         id: "worker-thinking",
         label: "Subagent thinking",
         description: "Default thinking level for spawned subagents; a role file may override",
         currentValue: workerThinkingDisplay(),
-        submenu: thinkingSubmenu(true),
+        submenu: thinkingSubmenu(),
       },
       {
         id: "default-role",
@@ -921,7 +804,7 @@ async function openSettingsUI(ctx: ExtensionContext): Promise<void> {
       {
         id: "reset",
         label: "Reset overrides",
-        description: "Clear brain/subagent model, thinking, default role, and concurrency (in draft)",
+        description: "Clear subagent model, thinking, default role, and concurrency (in draft)",
         currentValue: "press enter",
         values: ["press enter", "reset"],
       },
@@ -943,16 +826,7 @@ async function openSettingsUI(ctx: ExtensionContext): Promise<void> {
       getSettingsListTheme(),
       (id, newValue) => {
         // Mutate the draft only — no live application here.
-        if (id === "mode") {
-          if (newValue === "regular" || newValue === "brain") draft.mode = newValue;
-          settingsList.updateValue("mode", draft.mode);
-        } else if (id === "brain-model") {
-          draft.brainModel = newValue;
-          settingsList.updateValue("brain-model", brainModelDisplay());
-        } else if (id === "brain-thinking") {
-          if (validThinking(newValue)) draft.brainThinking = newValue;
-          settingsList.updateValue("brain-thinking", brainThinkingDisplay());
-        } else if (id === "worker-model") {
+        if (id === "worker-model") {
           draft.workerModel = newValue === "__inherit__" ? undefined : newValue;
           settingsList.updateValue("worker-model", workerModelDisplay());
         } else if (id === "worker-thinking") {
@@ -968,14 +842,10 @@ async function openSettingsUI(ctx: ExtensionContext): Promise<void> {
           settingsList.updateValue("max-concurrent", String(draft.maxConcurrent));
         } else if (id === "reset") {
           if (newValue === "reset") {
-            draft.brainModel = undefined;
-            draft.brainThinking = undefined;
             draft.workerModel = undefined;
             draft.workerThinking = undefined;
             draft.defaultRole = undefined;
             draft.maxConcurrent = DEFAULT_MAX_CONCURRENT;
-            settingsList.updateValue("brain-model", brainModelDisplay());
-            settingsList.updateValue("brain-thinking", brainThinkingDisplay());
             settingsList.updateValue("worker-model", workerModelDisplay());
             settingsList.updateValue("worker-thinking", workerThinkingDisplay());
             settingsList.updateValue("default-role", defaultRoleDisplay());
@@ -1131,24 +1001,14 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   // detection, so a stray delegation cannot spawn its own subagent.
 
   pi.on("session_start", async (_event, ctx) => {
-    // Mode is session-only; persisted model/thinking/role overrides are applied
-    // to the new session, but mode always starts as regular.
     resetSessionState();
     state.statusContexts.add(ctx);
-    if (!IS_WORKER_INSTANCE && state.config.brainModel) {
-      const model = findModel(ctx, state.config.brainModel);
-      if (model) {
-        if (!(await pi.setModel(model))) {
-          notify(ctx, `Could not authenticate persisted brain model: ${state.config.brainModel}`, "warning");
-        }
-      } else {
-        notify(ctx, `Persisted brain model is unavailable: ${state.config.brainModel}`, "warning");
-      }
-    }
-    if (!IS_WORKER_INSTANCE && state.config.brainThinking) pi.setThinkingLevel(state.config.brainThinking);
     applyStatus(ctx);
     if (!IS_WORKER_INSTANCE) {
-      notify(ctx, "Herdr worker ready in regular mode. Use /worker-config mode brain to delegate work to one-shot subagents.");
+      notify(
+        ctx,
+        "Herdr worker ready. worker_delegate and spawn_pi spawn one-shot pi subagents in Herdr tabs.",
+      );
     }
   });
 
@@ -1172,40 +1032,42 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     state.statusContexts.add(ctx);
     if (IS_WORKER_INSTANCE) {
+      // Worker instance: tell the model it is a one-shot implementation worker
+      // and that it must not spawn more subagents. End the final turn with a
+      // self-contained report; the orchestrator reads only that message.
       return {
-        systemPrompt: `${event.systemPrompt}\n\nSUBAGENT MODE: You are a one-time worker spawned by an orchestrator session. Execute delegated tasks directly in this repository. Do not delegate work to another agent and do not use worker_delegate or spawn commands. Your final message is captured automatically and returned to the orchestrator, so end your turn with a concise report: changes made, validation performed, any blockers.`,
+        systemPrompt: `${event.systemPrompt}\n\nSUBAGENT: You are a one-time worker spawned by a parent pi session via worker_delegate or spawn_pi. Execute the delegated task directly in this repository — inspect files, edit source, run tests, validate the result. Do not call worker_delegate or spawn_pi (your orchestrator would see those as runaway recursion). Your final message is captured automatically and returned to the orchestrator as your report, so end your turn with a self-contained summary: changes made, validation performed, any blockers.`,
       };
     }
-    if (state.config.mode !== "brain") return;
-    const roleNames = [...discoverRoles(ctx).keys()].join(", ");
-    const defaultRole = state.config.defaultRole ?? BUILTIN_WORKER_NAME;
-    return {
-      systemPrompt: `${event.systemPrompt}\n\nBRAIN MODE (ORCHESTRATOR): This session has switched roles and is now the brain. You must exclusively orchestrate and delegate; you do not do implementation work yourself. Do not use write, edit, bash, apply_patch, patch, delete, or move tools. Delegate all implementation, testing, and other non-trivial work to one-shot subagents with worker_delegate, passing role to pick a persona (default: ${defaultRole}). Available roles, defined in .pi/agents/<name>.md: ${roleNames}. Each delegation spawns a fresh pi subagent in its own Herdr tab, waits for its report, and closes the tab; subagents have no memory of this conversation, so keep delegation prompts complete and self-contained. Tasks with disjoint paths may run concurrently on separate subagents; overlapping or omitted paths serialize. Inspect and summarize each worker report before deciding the next delegation.`,
-    };
+    // Orchestrator/session: prime the model to recognize when delegation is
+    // warranted. The tool's own description covers parameters and concurrency;
+    // this nudge exists so the model reaches for it without first having to
+    // read the herdr-worker skill. De-dup against an existing primer block so
+    // any session that already received it (e.g. a follow-up turn after
+    // before_agent_start fired earlier) does not see it stacked.
+    const primer = `HERDR WORKER (delegation tools): This session can spawn one-shot pi subagents in their own Herdr tabs with the worker_delegate tool, or run an isolated single task with spawn_pi. Each subagent has its own clean context window, so use delegation when:
+  • the task is implementation, testing, or review work that benefits from isolation,
+  • independent tasks can run in parallel (pass disjoint paths to worker_delegate; up to max-concurrent),
+  • the user's request maps cleanly to a persona defined in .pi/agents/<role>.md (call with role: "<name>").
+Subagents have no memory of this conversation, so every prompt must be self-contained: the task, the relevant files, the desired behavior, and how to validate. Inspect each worker report and summarise the result before deciding the next delegation. For temporary one-shots that are not part of a coordinated plan, prefer spawn_pi over worker_delegate.`;
+    if (event.systemPrompt.includes(primer)) return;
+    return { systemPrompt: `${event.systemPrompt}\n\n${primer}` };
   });
 
   pi.on("tool_call", async (event) => {
-    if (IS_WORKER_INSTANCE) {
-      // A spawned subagent must never orchestrate its own workers.
-      if (event.toolName === "worker_delegate" || MUTATING_TOOLS.has(event.toolName)) {
-        return {
-          block: true,
-          reason: `Blocked in subagent mode: ${event.toolName}. You are the worker — execute the task directly and report.`,
-        };
-      }
-      return;
-    }
-    if (state.config.mode === "brain" && MUTATING_TOOLS.has(event.toolName)) {
+    if (IS_WORKER_INSTANCE && BLOCKED_IN_WORKER.has(event.toolName)) {
+      // A spawned subagent must never orchestrate its own workers — that would
+      // turn a one-shot into a runaway tree of Herdr tabs.
       return {
         block: true,
-        reason: `Blocked in brain mode: ${event.toolName} is a mutation tool. You are the orchestrator — delegate this work to a subagent with worker_delegate.`,
+        reason: `Blocked in subagent mode: ${event.toolName}. You are the worker — execute the task directly and report.`,
       };
     }
   });
 
   pi.registerCommand("worker-config", {
     description:
-      "Open the worker settings UI, or configure it via subcommands (mode, default-role, max-concurrent, roles, brain-model, worker-model, thinking, reset)",
+      "Open the worker settings UI, or configure it via subcommands (default-role, max-concurrent, roles, worker-model, worker-thinking, reset)",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       // No arguments opens the interactive settings UI.
@@ -1224,9 +1086,6 @@ export default function herdrSpawn(pi: ExtensionAPI) {
         if (key === "ui") {
           await openSettingsUI(ctx);
           return;
-        } else if (key === "mode") {
-          if (value !== "regular" && value !== "brain") throw new Error("Usage: /worker-config mode regular|brain");
-          setMode(value, ctx);
         } else if (key === "default-role") {
           if (!value) throw new Error("Usage: /worker-config default-role <role> (see /worker-config roles)");
           state.roleCache = undefined;
@@ -1250,14 +1109,6 @@ export default function herdrSpawn(pi: ExtensionAPI) {
               .map((role) => `- ${role.name}: ${role.description}${role.sourcePath ? ` (${role.sourcePath})` : ""}`)
               .join("\n"),
           );
-        } else if (key === "brain-model") {
-          if (!value) throw new Error("Usage: /worker-config brain-model <provider/model>");
-          await setBrainModel(value, ctx);
-          notify(ctx, `Brain model set to ${state.config.brainModel}.`);
-        } else if (key === "brain-thinking") {
-          if (!validThinking(value)) throw new Error("Usage: /worker-config brain-thinking <off|minimal|low|medium|high|xhigh|max>");
-          setBrainThinking(value);
-          notify(ctx, `Brain thinking level set to ${value}.`);
         } else if (key === "worker-model" || key === "worker-thinking") {
           if (key === "worker-thinking" && !validThinking(value)) {
             throw new Error("Usage: /worker-config worker-thinking <off|minimal|low|medium|high|xhigh|max>");
@@ -1266,17 +1117,15 @@ export default function herdrSpawn(pi: ExtensionAPI) {
           applyWorkerSetting(key, value, ctx);
           notify(ctx, `${key} set to ${value}. Takes effect on the next subagent spawn.`);
         } else if (key === "reset") {
-          state.config.brainModel = undefined;
-          state.config.brainThinking = undefined;
           state.config.workerModel = undefined;
           state.config.workerThinking = undefined;
           state.config.defaultRole = undefined;
           state.config.maxConcurrent = DEFAULT_MAX_CONCURRENT;
           savePersistedConfig();
-          notify(ctx, "Worker configuration reset. Mode remains unchanged.");
+          notify(ctx, "Worker configuration reset.");
         } else {
           throw new Error(
-            "Usage: /worker-config [ui|show|mode|default-role|max-concurrent|roles|brain-model|brain-thinking|worker-model|worker-thinking|reset] ... (run with no arguments to open the settings UI)",
+            "Usage: /worker-config [ui|show|default-role|max-concurrent|roles|worker-model|worker-thinking|reset] ... (run with no arguments to open the settings UI)",
           );
         }
         applyStatus(ctx);
@@ -1297,12 +1146,12 @@ export default function herdrSpawn(pi: ExtensionAPI) {
         const response = await delegate(ctx, input as WorkerDelegateArgs);
         return {
           content: [{ type: "text", text: response }],
-          details: { mode: state.config.mode },
+          details: {},
         };
       } catch (error: any) {
         return {
           content: [{ type: "text", text: error.message }],
-          details: { mode: state.config.mode },
+          details: {},
           isError: true,
         };
       }

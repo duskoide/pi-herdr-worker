@@ -4,38 +4,41 @@ Spawn pi subagents in isolated Herdr panes — one-shot delegations in their own
 
 ## Quick Start
 
-After installing this package with `pi install npm:pi-herdr-worker`, Pi starts in regular mode. Configure the session-only brain/worker workflow with:
+After installing this package with `pi install npm:pi-herdr-worker`, two delegation tools become available in every session:
+
+```text
+worker_delegate({ prompt: "Implement the API and tests", paths: ["src/api.ts", "tests/api.test.ts"] })
+worker_delegate({ prompt: "Review the auth module", role: "reviewer" })
+spawn_pi({ prompt: "Run npm test and report failures" })
+```
+
+- **`worker_delegate`** spawns a fresh one-shot pi subagent in its own Herdr tab, waits for its report, and closes the tab. Pass `paths` to enable parallel execution of disjoint scopes (bounded by `max-concurrent`); pass `role` to pick a persona from `.pi/agents/<role>.md`.
+- **`spawn_pi`** spawns a temporary pi agent in a split pane for short-lived, independent tasks; it closes the pane when it returns.
+
+Configure defaults with `/worker-config`:
 
 ```text
 /worker-config show
-/worker-config mode brain
 /worker-config default-role <role>
 /worker-config max-concurrent <n>
-/worker-config brain-model <provider/model>
-/worker-config brain-thinking <level>
 /worker-config worker-model <provider/model>
 /worker-config worker-thinking <level>
 /worker-config roles
 ```
 
-In brain mode, the current session **changes role to the brain/orchestrator** and delegates implementation, testing, and review work through `worker_delegate`. Every delegation spawns a **fresh one-shot pi subagent** in its own Herdr tab, runs the task, returns its report, and closes the tab. The brain's mutation tools are blocked in this mode.
+## Roles
 
-Roles are personas defined in `.pi/agents/<role>.md`; a role supplies a custom system prompt and optional model/thinking/tools. Pick one per delegation or set a default:
+A **role** is a persona — a custom system prompt (and optional `model`, `thinking`, `tools`) for a spawned subagent. Roles live in `.pi/agents/<role>.md` (project), `.agents/agents/<role>.md` (workspace), or `~/.pi/agent/agents/<role>.md` (global); project wins.
 
 ```text
 worker_delegate({ prompt: "Implement the API and tests", role: "impl" })
+worker_delegate({ prompt: "Review the auth module", role: "reviewer" })
 /worker-config default-role impl
-```
-
-Return to direct work with:
-
-```text
-/worker-config mode regular
 ```
 
 ## Temporary agents
 
-For an independent one-shot task, use:
+For an independent one-shot task outside a coordinated plan, use the slash commands:
 
 ```text
 /spawn Run tests and report failures
@@ -43,8 +46,6 @@ For an independent one-shot task, use:
 /spawnlist
 /spawnkill pi-test-runner
 ```
-
-These commands create a temporary pane, start a pi agent, wait for its response, and close the pane.
 
 ## Requirements
 
