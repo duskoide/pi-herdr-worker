@@ -260,8 +260,14 @@ function roleSystemPrompt(role: RoleDef): string {
   // the subagent reliably recognises itself as a worker (IS_WORKER_INSTANCE
   // scans its own argv for this text). A role body alone would otherwise let a
   // replace-mode role run as if it were the brain session.
-  if (role.promptMode === "replace") return `${MARKER_LINE}\n\n${role.prompt}`;
-  return `${WORKER_SYSTEM_PROMPT}\n\n${role.prompt}`;
+  //
+  // The assembled prompt is passed through herdr `agent start -- ... --append-system-prompt ...`.
+  // Herdr encodes every argv entry into a single command line for the target pane's
+  // shell, and rejects newlines as unsafe to encode — so the prompt has to be a
+  // single line. Collapse any whitespace run (including newlines from role bodies
+  // that contain paragraphs) into single spaces before sending.
+  const raw = role.promptMode === "replace" ? `${MARKER_LINE} ${role.prompt}` : `${WORKER_SYSTEM_PROMPT} ${role.prompt}`;
+  return raw.replace(/\s+/g, " ").trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +302,8 @@ async function waitForShell(startArgs: string[], paneId: string, attempts = 25, 
     try {
       await runHerdr(startArgs);
       return;
-    } catch (error: any) {
-      const message = error.message ?? "";
+    } catch (error: unknown) {
+      const message = errorMessage(error);
       if (!message.includes("agent_pane_busy") && !message.includes("not an available shell")) {
         throw error;
       }
@@ -307,12 +313,40 @@ async function waitForShell(startArgs: string[], paneId: string, attempts = 25, 
   throw new Error(`Herdr pane ${paneId} never became an available shell.`);
 }
 
+// Submit a prompt and wait for the agent to settle. Herdr's `agent prompt --wait`
+// has a hard 5-second gate that fires whenever the agent starts from a
+// non-working state and demands an observed state change inside that window;
+// if the subagent's first turn takes longer than 5s (common for cold-start
+// model calls), the gate rejects with agent_prompt_stalled even though the
+// subagent is doing exactly what was asked. Splitting submission from waiting
+// sidesteps the gate: the unconditional `agent wait --until ...` does not have
+// it.
+async function submitAndAwaitAgent(name: string, prompt: string, timeoutMs: number): Promise<void> {
+  await runHerdr(["agent", "prompt", name, prompt]);
+  await runHerdr(
+    ["agent", "wait", name, "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", String(timeoutMs)],
+    timeoutMs + 30000,
+  );
+}
+
 function parseJson<T>(output: string): T {
   return JSON.parse(output) as T;
 }
 
 function slugRole(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 12) || "role";
+}
+
+// Extract a string message from an unknown caught value. We catch as `unknown`
+// everywhere so TypeScript can keep its narrowing; this helper covers the common
+// shapes — Error instances, plain strings, and unknown objects with a `.message`.
+function errorMessage(error: unknown, fallback = ""): string {
+  if (error instanceof Error) return error.message || fallback;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+    return error.message;
+  }
+  return fallback;
 }
 
 function spawnName(roleName: string): string {
@@ -428,8 +462,10 @@ function loadPersistedConfig(): PersistedWorkerConfig {
           ? Math.floor(stored.maxConcurrent)
           : DEFAULT_MAX_CONCURRENT,
     };
-  } catch (error: any) {
-    if (error?.code === "ENOENT") return persistedDefaults();
+  } catch (error: unknown) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return persistedDefaults();
+    }
     // Leave malformed settings untouched; Pi remains usable and can report the
     // malformed file through its normal settings handling.
     return persistedDefaults();
@@ -442,8 +478,10 @@ function savePersistedConfig(): void {
   let settings: Record<string, unknown> = {};
   try {
     settings = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-  } catch (error: any) {
-    if (error?.code !== "ENOENT") throw new Error(`Could not read ${path}: ${error.message}`);
+  } catch (error: unknown) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+      throw new Error(`Could not read ${path}: ${errorMessage(error, "<unknown>")}`);
+    }
   }
 
   // Drop legacy brain-* fields so old settings.json files don't keep stale data.
@@ -510,10 +548,7 @@ async function runDelegation(record: ActiveDelegation) {
     await waitForShell(startArgs, record.paneId);
 
     const timeout = job.args.timeout ?? DEFAULT_WORKER_TIMEOUT;
-    await runHerdr(
-      ["agent", "prompt", record.name, job.args.prompt, "--wait", "--timeout", String(timeout)],
-      timeout + 30000,
-    );
+    await submitAndAwaitAgent(record.name, job.args.prompt, timeout);
     const report = await runHerdr([
       "agent",
       "read",
@@ -877,8 +912,8 @@ async function openSettingsUI(ctx: ExtensionContext): Promise<void> {
               await saveDraft();
               notify(ctx, "Worker settings saved.");
               refreshHelp();
-            } catch (error: any) {
-              notify(ctx, error.message, "error");
+            } catch (error: unknown) {
+              notify(ctx, errorMessage(error, "<unknown>"), "error");
             } finally {
               saving = false;
               tui.requestRender();
@@ -971,14 +1006,11 @@ async function runOneShot(parsed: OneShotArgs, ctx: ExtensionContext | undefined
       if (parsed.thinking) startArgs.push("--thinking", parsed.thinking);
     }
     await waitForShell(startArgs, paneId);
-    await runHerdr(
-      ["agent", "prompt", name, parsed.prompt, "--wait", "--timeout", String(parsed.timeout)],
-      parsed.timeout + 30000,
-    );
+    await submitAndAwaitAgent(name, parsed.prompt, parsed.timeout);
     const response = await runHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "100"]);
     return `Agent ${name} completed in pane ${paneId}\n\n${response}`;
-  } catch (error: any) {
-    return `Failed: ${error.message}`;
+  } catch (error: unknown) {
+    return `Failed: ${errorMessage(error)}`;
   } finally {
     if (paneId) {
       try {
@@ -1129,8 +1161,8 @@ Subagents have no memory of this conversation, so every prompt must be self-cont
           );
         }
         applyStatus(ctx);
-      } catch (error: any) {
-        notify(ctx, error.message, "error");
+      } catch (error: unknown) {
+        notify(ctx, errorMessage(error, "<unknown>"), "error");
       }
     },
   });
@@ -1148,9 +1180,9 @@ Subagents have no memory of this conversation, so every prompt must be self-cont
           content: [{ type: "text", text: response }],
           details: {},
         };
-      } catch (error: any) {
+      } catch (error: unknown) {
         return {
-          content: [{ type: "text", text: error.message }],
+          content: [{ type: "text", text: errorMessage(error, "<unknown>") }],
           details: {},
           isError: true,
         };
@@ -1169,8 +1201,8 @@ Subagents have no memory of this conversation, so every prompt must be self-cont
         }
         const result = await runOneShot(parsed, ctx, ctx.cwd);
         notify(ctx, result, result.startsWith("Failed") ? "error" : "info");
-      } catch (error: any) {
-        notify(ctx, error.message, "error");
+      } catch (error: unknown) {
+        notify(ctx, errorMessage(error, "<unknown>"), "error");
       }
     },
   });
@@ -1185,8 +1217,8 @@ Subagents have no memory of this conversation, so every prompt must be self-cont
           return;
         }
         notify(ctx, await runOneShot(parsed, ctx, ctx.cwd));
-      } catch (error: any) {
-        notify(ctx, error.message, "error");
+      } catch (error: unknown) {
+        notify(ctx, errorMessage(error, "<unknown>"), "error");
       }
     },
   });
@@ -1204,8 +1236,8 @@ Subagents have no memory of this conversation, so every prompt must be self-cont
             ? agents.map((agent) => `- ${agent.name} (${agent.agent_status}) in ${agent.pane_id}`).join("\n")
             : "No agents currently running.",
         );
-      } catch (error: any) {
-        notify(ctx, `Failed: ${error.message}`, "error");
+      } catch (error: unknown) {
+        notify(ctx, `Failed: ${errorMessage(error)}`, "error");
       }
     },
   });
@@ -1224,8 +1256,8 @@ Subagents have no memory of this conversation, so every prompt must be self-cont
         if (!paneId && !tabId) throw new Error(`Agent not found: ${name}`);
         await closeTab({ tabId, paneId });
         notify(ctx, `Killed agent ${name}.`);
-      } catch (error: any) {
-        notify(ctx, `Failed: ${error.message}`, "error");
+      } catch (error: unknown) {
+        notify(ctx, `Failed: ${errorMessage(error)}`, "error");
       }
     },
   });
