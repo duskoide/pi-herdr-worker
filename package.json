@@ -1,8 +1,8 @@
 {
   "name": "pi-herdr-worker",
-  "version": "1.0.0",
-  "description": "Spawn pi agents in isolated Herdr panes for parallel task execution",
-  "keywords": ["pi-package", "herdr", "agent", "spawn", "parallel", "multiplexer"],
+  "version": "2.0.0",
+  "description": "Delegate work to one-shot pi subagents (with role personas) in isolated Herdr panes for parallel task execution",
+  "keywords": ["pi-package", "herdr", "agent", "subagent", "spawn", "parallel", "role", "multiplexer"],
   "author": "duskoide",
   "license": "MIT",
   "repository": {

@@ -1,6 +1,6 @@
 # Herdr Worker Skill
 
-Run pi agents in isolated Herdr panes, including the persistent worker used by brain mode in its own tab.
+Spawn pi subagents in isolated Herdr panes — one-shot delegations in their own tabs, or temporary agents in split panes.
 
 ## Quick Start
 
@@ -9,19 +9,22 @@ After installing this package with `pi install npm:pi-herdr-worker`, Pi starts i
 ```text
 /worker-config show
 /worker-config mode brain
+/worker-config default-role <role>
+/worker-config max-concurrent <n>
 /worker-config brain-model <provider/model>
 /worker-config brain-thinking <level>
 /worker-config worker-model <provider/model>
 /worker-config worker-thinking <level>
+/worker-config roles
 ```
 
-In brain mode, the current session **changes role to the brain/orchestrator** and delegates implementation, testing, and review work through `worker_delegate`. One worker pi is spawned in a new Herdr tab and receives serialized tasks. The brain's mutation tools are blocked in this mode.
+In brain mode, the current session **changes role to the brain/orchestrator** and delegates implementation, testing, and review work through `worker_delegate`. Every delegation spawns a **fresh one-shot pi subagent** in its own Herdr tab, runs the task, returns its report, and closes the tab. The brain's mutation tools are blocked in this mode.
 
-Close the worker (agent + Herdr tab) when you're done with it:
+Roles are personas defined in `.pi/agents/<role>.md`; a role supplies a custom system prompt and optional model/thinking/tools. Pick one per delegation or set a default:
 
 ```text
-worker_delegate({ prompt: "Run tests and report failures", closeAfter: true })
-/worker-config close
+worker_delegate({ prompt: "Implement the API and tests", role: "impl" })
+/worker-config default-role impl
 ```
 
 Return to direct work with:

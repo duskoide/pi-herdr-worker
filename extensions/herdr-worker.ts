@@ -1,5 +1,12 @@
-import { execFileSync } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { execFile, execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import {
+  getAgentDir,
+  parseFrontmatter,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import {
   Container,
@@ -30,6 +37,8 @@ const THINKING_ORDER: ThinkingLevel[] = [
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(THINKING_ORDER);
 
+const CONCURRENT_CHOICES = ["1", "2", "3", "4", "6", "8"];
+
 const MUTATING_TOOLS = new Set([
   "write",
   "edit",
@@ -41,26 +50,71 @@ const MUTATING_TOOLS = new Set([
 ]);
 
 const WorkerDelegateInput = Type.Object({
-  prompt: Type.String({ description: "A complete implementation, testing, or review task for the spawned worker" }),
-  timeout: Type.Optional(Type.Number({ description: "Worker timeout in milliseconds (default: 300000)" })),
-  closeAfter: Type.Optional(
-    Type.Boolean({
+  prompt: Type.String({
+    description:
+      "A complete, self-contained implementation, testing, or review task for the subagent. It has no memory of this conversation.",
+  }),
+  role: Type.Optional(
+    Type.String({
       description:
-        "When true, close the worker and its Herdr pane after this task completes. The next delegation spawns a fresh worker. Default: false (worker stays alive for reuse).",
+        "Role name for the subagent, resolved from .pi/agents/<role>.md (project), .agents/agents/<role>.md (workspace), or ~/.pi/agent/agents/<role>.md (global). Falls back to the configured default role, then to the built-in generic worker.",
     }),
   ),
+  paths: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Files or directories this task may modify. Disjoint path scopes may run concurrently on separate subagents; omit for an exclusive task.",
+    }),
+  ),
+  timeout: Type.Optional(Type.Number({ description: "Subagent timeout in milliseconds (default: 300000)" })),
 });
 
 type WorkerDelegateArgs = {
   prompt: string;
+  role?: string;
+  paths?: string[];
   timeout?: number;
-  closeAfter?: boolean;
 };
 
-type WorkerHandle = {
+/** A role definition loaded from a pi-style agent markdown file. */
+type RoleDef = {
   name: string;
-  paneId: string;
+  description: string;
+  /** Markdown body used as the subagent system prompt. */
+  prompt: string;
+  /** "append" adds the body to the worker preamble; "replace" uses the body alone. */
+  promptMode: "append" | "replace";
+  model?: string;
+  thinking?: ThinkingLevel;
+  /** pi --tools allowlist, passed through verbatim when set. */
+  tools?: string;
+  sourcePath?: string;
+};
+
+type HerdrAgent = {
+  agent?: string;
+  agent_status?: string;
+  name?: string;
+  pane_id?: string;
+  tab_id?: string;
+};
+
+type DelegationJob = {
+  args: WorkerDelegateArgs;
+  ctx: ExtensionContext;
+  scopes: string[];
+  role: RoleDef;
+  resolve: (report: string) => void;
+  reject: (error: unknown) => void;
+};
+
+/** One running one-shot subagent. Each delegation owns its Herdr tab. */
+type ActiveDelegation = {
+  job: DelegationJob;
+  role: RoleDef;
+  name: string;
   tabId?: string;
+  paneId?: string;
 };
 
 type WorkerConfig = {
@@ -69,16 +123,162 @@ type WorkerConfig = {
   brainThinking?: ThinkingLevel;
   workerModel?: string;
   workerThinking?: ThinkingLevel;
+  /** Role used when worker_delegate omits `role`. Undefined = generic worker. */
+  defaultRole?: string;
+  maxConcurrent: number;
 };
 
 const DEFAULT_WORKER_TIMEOUT = 300000;
+const DEFAULT_MAX_CONCURRENT = 4;
+const WORKER_SETTINGS_KEY = "herdrWorker";
+const BUILTIN_WORKER_NAME = "worker";
+
 const WORKER_SYSTEM_PROMPT = [
-  "You are the implementation worker for a parent pi session.",
-  "The parent session is the orchestrator. Execute the delegated task directly in this repository.",
+  "You are a one-time implementation subagent spawned by a parent pi session.",
+  "The parent session is the orchestrator and will not see this conversation after you finish.",
+  "Execute the delegated task directly in this repository.",
   "You may inspect files, edit source, run tests, and validate the result.",
-  "Do not delegate work to another agent and do not use worker-mode commands.",
-  "Return a concise report containing changes made, validation performed, and any blockers.",
+  "Do not delegate work to another agent and do not use worker-mode or spawn commands.",
+  "When the task is complete, output a single final report as your last message:",
+  "changes made, validation performed, and any blockers.",
+  "The parent reads only your most recent output, so make the final message self-contained.",
 ].join(" ");
+
+// Marker phrase the orchestrator injects into every subagent's system prompt.
+// pi gives spawned processes no dedicated env var, so a worker recognises
+// itself by finding this text in its own argv.
+const SPAWN_MARKER = "one-time implementation subagent";
+
+function detectWorkerInstance(): boolean {
+  if (process.env.PI_HERDR_WORKER === "1") return true;
+  return process.argv.some((arg) => arg.includes(SPAWN_MARKER));
+}
+
+const IS_WORKER_INSTANCE = detectWorkerInstance();
+
+// ---------------------------------------------------------------------------
+// Session state
+//
+// Everything mutable lives at module scope so the queue, tab bookkeeping, and
+// config stay reachable from every helper and from lifecycle hooks. Pi reloads
+// the module per session/reload, but because session_start re-fires on switch,
+// resetSessionState() guarantees a clean slate either way. Mode is deliberately
+// never loaded from disk: every session starts regular, while model/thinking/
+// role overrides survive through settings.json.
+// ---------------------------------------------------------------------------
+
+const state = {
+  pi: undefined as ExtensionAPI | undefined,
+  config: { mode: "regular", maxConcurrent: DEFAULT_MAX_CONCURRENT } as WorkerConfig,
+  activeDelegations: [] as ActiveDelegation[],
+  pendingDelegations: [] as DelegationJob[],
+  statusContexts: new Set<ExtensionContext>(),
+  roleCache: undefined as { key: string; roles: Map<string, RoleDef> } | undefined,
+};
+
+function resetSessionState(): void {
+  state.activeDelegations.length = 0;
+  state.pendingDelegations.length = 0;
+  state.statusContexts.clear();
+  state.roleCache = undefined;
+  state.config = { mode: "regular", ...loadPersistedConfig() };
+}
+
+// ---------------------------------------------------------------------------
+// Role discovery
+// ---------------------------------------------------------------------------
+
+function str(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function loadRoleDir(dir: string, roles: Map<string, RoleDef>): void {
+  if (!existsSync(dir)) return;
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((file) => file.endsWith(".md"));
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const path = join(dir, file);
+    let parsed: { frontmatter: Record<string, unknown>; body: string };
+    try {
+      parsed = parseFrontmatter<Record<string, unknown>>(readFileSync(path, "utf8"));
+    } catch {
+      // One malformed role file must not break discovery of the others.
+      continue;
+    }
+    const fm = parsed.frontmatter;
+    if (fm.enabled === false) continue;
+    const declared = str(fm.name);
+    // Colons are reserved by pi's agent convention for plugin-scoped ids.
+    if (declared?.includes(":")) continue;
+    const name = declared ?? file.replace(/\.md$/, "");
+    const tools = str(fm.tools);
+    const thinking = str(fm.thinking);
+    roles.set(name, {
+      name,
+      description: str(fm.description) ?? name,
+      prompt: parsed.body.trim(),
+      promptMode: fm.prompt_mode === "append" ? "append" : "replace",
+      model: str(fm.model),
+      thinking: thinking && validThinking(thinking) ? (thinking as ThinkingLevel) : undefined,
+      // "all" / "*" mean the default toolset, which needs no flag.
+      tools: tools && tools !== "all" && tools !== "*" ? tools : undefined,
+      sourcePath: path,
+    });
+  }
+}
+
+function builtinWorkerRole(): RoleDef {
+  return {
+    name: BUILTIN_WORKER_NAME,
+    description: "Generic one-shot implementation worker (built-in)",
+    prompt: WORKER_SYSTEM_PROMPT,
+    promptMode: "replace",
+  };
+}
+
+/**
+ * Discover role definitions. Priority (later entries override earlier ones):
+ * built-in "worker" < global ~/.pi/agent/agents/ < workspace <cwd>/.agents/agents/
+ * < project <cwd>/.pi/agents/. Same layout pi's subagent packages use, so a
+ * role file is also reusable as a native subagent type.
+ */
+function discoverRoles(ctx: ExtensionContext): Map<string, RoleDef> {
+  const key = resolve(ctx.cwd);
+  if (state.roleCache?.key === key) return state.roleCache.roles;
+  const roles = new Map<string, RoleDef>();
+  roles.set(BUILTIN_WORKER_NAME, builtinWorkerRole());
+  loadRoleDir(join(getAgentDir(), "agents"), roles);
+  loadRoleDir(join(key, ".agents", "agents"), roles);
+  loadRoleDir(join(key, ".pi", "agents"), roles);
+  state.roleCache = { key, roles };
+  return roles;
+}
+
+/**
+ * Resolve a role by name. An unknown name falls back to the built-in generic
+ * worker (with a warning) rather than failing the delegation: a stale default
+ * role in settings.json must not block work.
+ */
+function resolveRole(ctx: ExtensionContext, requested: string | undefined): { role: RoleDef; fellBack: boolean } {
+  const roles = discoverRoles(ctx);
+  const name = requested ?? state.config.defaultRole ?? BUILTIN_WORKER_NAME;
+  const role = roles.get(name) ?? roles.get(name.toLowerCase());
+  if (role) return { role, fellBack: false };
+  return { role: roles.get(BUILTIN_WORKER_NAME)!, fellBack: name !== BUILTIN_WORKER_NAME };
+}
+
+function roleSystemPrompt(role: RoleDef): string {
+  if (role.promptMode === "replace") return role.prompt;
+  return `${WORKER_SYSTEM_PROMPT}\n\n${role.prompt}`;
+}
+
+// ---------------------------------------------------------------------------
+// Herdr plumbing
+// ---------------------------------------------------------------------------
 
 function runHerdr(args: string[], timeout = 30000): string {
   return execFileSync("herdr", args, {
@@ -88,11 +288,25 @@ function runHerdr(args: string[], timeout = 30000): string {
   });
 }
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+function runHerdrAsync(args: string[], timeout = 30000): Promise<string> {
+  return new Promise((resolveOutput, reject) => {
+    execFile(
+      "herdr",
+      args,
+      { encoding: "utf8", timeout, maxBuffer: 10 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) reject(error);
+        else resolveOutput(stdout);
+      },
+    );
+  });
+}
 
-// A freshly split pane is not immediately an available shell; Herdr reports
-// agent_pane_busy until the shell reaches its interactive prompt. Retry the
-// start for a few seconds before giving up.
+const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
+
+// A freshly opened tab's shell is not immediately an available shell; Herdr
+// reports agent_pane_busy until the shell reaches its interactive prompt.
+// Retry the start for a few seconds before giving up.
 async function waitForShell(startArgs: string[], paneId: string, attempts = 25, delayMs = 200): Promise<void> {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
@@ -113,43 +327,48 @@ function parseJson<T>(output: string): T {
   return JSON.parse(output) as T;
 }
 
-function currentModelId(ctx: ExtensionContext): string | undefined {
-  return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+function slugRole(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 12) || "role";
 }
 
-function describeConfig(config: WorkerConfig, worker: WorkerHandle | undefined, ctx: ExtensionContext): string {
-  return [
-    `mode: ${config.mode}`,
-    `brain model: ${config.brainModel ?? currentModelId(ctx) ?? "current"}`,
-    `brain thinking: ${config.brainThinking ?? ctx.thinkingLevel ?? "current"}`,
-    `worker model: ${config.workerModel ?? currentModelId(ctx) ?? "parent model"}`,
-    `worker thinking: ${config.workerThinking ?? ctx.thinkingLevel ?? "parent level"}`,
-    `worker: ${worker ? `${worker.name} (${worker.paneId})` : "not running"}`,
-    "",
-    "Run /worker-config with no arguments to open the interactive settings UI, or use:",
-    "/worker-config mode regular|brain",
-    "/worker-config brain-model <provider/model>",
-    "/worker-config brain-thinking <off|minimal|low|medium|high|xhigh|max>",
-    "/worker-config worker-model <provider/model>",
-    "/worker-config worker-thinking <off|minimal|low|medium|high|xhigh|max>",
-  ].join("\n");
+function spawnName(roleName: string): string {
+  // pi's agent naming rule: lowercase start, [a-z0-9_-], max 31 chars.
+  return `pi-worker-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}-${slugRole(roleName)}`.slice(0, 31);
+}
+
+function closeTab(record: Pick<ActiveDelegation, "tabId" | "paneId">) {
+  try {
+    if (record.tabId) runHerdr(["tab", "close", record.tabId]);
+    else if (record.paneId) runHerdr(["pane", "close", record.paneId]);
+  } catch {
+    // The tab or pane may already have been closed by Herdr or the user.
+  }
+}
+
+/** pi arguments for a subagent spawn; must come after `--` in `herdr agent start`. */
+function rolePiArgs(role: RoleDef, model: string | undefined, thinking: ThinkingLevel | undefined, sessionName: string): string[] {
+  const piArgs: string[] = [];
+  if (model) piArgs.push("--model", model);
+  if (thinking) piArgs.push("--thinking", thinking);
+  if (role.tools) piArgs.push("--tools", role.tools);
+  piArgs.push("--name", sessionName, "--append-system-prompt", roleSystemPrompt(role));
+  return piArgs;
+}
+
+// ---------------------------------------------------------------------------
+// Small shared helpers
+// ---------------------------------------------------------------------------
+
+function currentModelId(ctx: ExtensionContext): string | undefined {
+  return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
 
 function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info") {
   ctx.ui.notify(message, level);
 }
 
-function applyStatus(ctx: ExtensionContext, config: WorkerConfig, worker: WorkerHandle | undefined) {
-  const theme = ctx.ui.theme;
-  const isBrain = config.mode === "brain";
-  const label = theme.fg("muted", "working mode:");
-  const mode = isBrain
-    ? theme.fg("accent", theme.bold("brain"))
-    : theme.fg("success", theme.bold("regular"));
-  const workerTag = worker
-    ? ` ${theme.fg("muted", "·")} ${theme.fg("warning", "●")} ${theme.fg("muted", worker.name)}`
-    : "";
-  ctx.ui.setStatus("herdr-worker", `${label} ${mode}${workerTag}`);
+function validThinking(value: string): value is ThinkingLevel {
+  return THINKING_LEVELS.has(value as ThinkingLevel);
 }
 
 function findModel(ctx: ExtensionContext, requested: string) {
@@ -159,480 +378,820 @@ function findModel(ctx: ExtensionContext, requested: string) {
   return ctx.modelRegistry.getAvailable().find((model) => model.id === requested);
 }
 
-function modelArgument(ctx: ExtensionContext, configured: string | undefined): string | undefined {
-  return configured ?? currentModelId(ctx);
+function describeConfig(ctx: ExtensionContext): string {
+  const config = state.config;
+  return [
+    `mode: ${config.mode}`,
+    `brain model: ${config.brainModel ?? currentModelId(ctx) ?? "current"}`,
+    `brain thinking: ${config.brainThinking ?? ctx.thinkingLevel ?? "current"}`,
+    `subagent default model: ${config.workerModel ?? currentModelId(ctx) ?? "parent model"}`,
+    `subagent default thinking: ${config.workerThinking ?? ctx.thinkingLevel ?? "parent level"}`,
+    `default role: ${config.defaultRole ?? `${BUILTIN_WORKER_NAME} (generic)`}`,
+    `max concurrent subagents: ${config.maxConcurrent}`,
+    `delegations: ${state.activeDelegations.length} active, ${state.pendingDelegations.length} queued`,
+    "",
+    "Run /worker-config with no arguments to open the interactive settings UI, or use:",
+    "/worker-config mode regular|brain",
+    "/worker-config default-role <role>",
+    "/worker-config max-concurrent <n>",
+    "/worker-config roles",
+    "/worker-config brain-model <provider/model>",
+    "/worker-config brain-thinking <off|minimal|low|medium|high|xhigh|max>",
+    "/worker-config worker-model <provider/model>",
+    "/worker-config worker-thinking <off|minimal|low|medium|high|xhigh|max>",
+  ].join("\n");
 }
 
-function validThinking(value: string): value is ThinkingLevel {
-  return THINKING_LEVELS.has(value as ThinkingLevel);
+function applyStatus(ctx: ExtensionContext) {
+  const theme = ctx.ui.theme;
+  const isBrain = state.config.mode === "brain";
+  const label = theme.fg("muted", "working mode:");
+  const mode = isBrain
+    ? theme.fg("accent", theme.bold("brain"))
+    : theme.fg("success", theme.bold("regular"));
+  const active = state.activeDelegations.length;
+  const tag = isBrain && active > 0 ? ` ${theme.fg("muted", "·")} ${theme.fg("warning", `● ${active} active`)}` : "";
+  ctx.ui.setStatus("herdr-worker", `${label} ${mode}${tag}`);
 }
 
-function closeWorker(worker: WorkerHandle | undefined) {
-  if (!worker) return;
-  try {
-    if (worker.tabId) runHerdr(["tab", "close", worker.tabId]);
-    else runHerdr(["pane", "close", worker.paneId]);
-  } catch {
-    // The tab or pane may already have been closed by Herdr or the user.
+function refreshStatus() {
+  for (const ctx of state.statusContexts) {
+    try {
+      applyStatus(ctx);
+    } catch {
+      // The context may belong to a replaced session; skip it.
+    }
   }
 }
 
-export default function herdrSpawn(pi: ExtensionAPI) {
-  // This state intentionally lives only in the extension instance. It resets to
-  // regular mode whenever pi opens, reloads, or switches sessions.
-  const config: WorkerConfig = { mode: "regular" };
-  let worker: WorkerHandle | undefined;
-  let workerQueue: Promise<unknown> = Promise.resolve();
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
 
-  const stopWorker = async (ctx?: ExtensionContext) => {
-    const active = worker;
-    worker = undefined;
-    closeWorker(active);
-    if (ctx) applyStatus(ctx, config, worker);
+type PersistedWorkerConfig = Omit<WorkerConfig, "mode">;
+
+function persistedDefaults(): PersistedWorkerConfig {
+  return { maxConcurrent: DEFAULT_MAX_CONCURRENT };
+}
+
+function loadPersistedConfig(): PersistedWorkerConfig {
+  try {
+    const raw = JSON.parse(readFileSync(join(getAgentDir(), "settings.json"), "utf8")) as Record<string, unknown>;
+    const value = raw[WORKER_SETTINGS_KEY];
+    if (!value || typeof value !== "object") return persistedDefaults();
+    const stored = value as Record<string, unknown>;
+    return {
+      brainModel: typeof stored.brainModel === "string" ? stored.brainModel : undefined,
+      brainThinking:
+        typeof stored.brainThinking === "string" && validThinking(stored.brainThinking)
+          ? stored.brainThinking
+          : undefined,
+      workerModel: typeof stored.workerModel === "string" ? stored.workerModel : undefined,
+      workerThinking:
+        typeof stored.workerThinking === "string" && validThinking(stored.workerThinking)
+          ? stored.workerThinking
+          : undefined,
+      defaultRole: typeof stored.defaultRole === "string" ? stored.defaultRole : undefined,
+      maxConcurrent:
+        typeof stored.maxConcurrent === "number" && stored.maxConcurrent >= 1
+          ? Math.floor(stored.maxConcurrent)
+          : DEFAULT_MAX_CONCURRENT,
+    };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return persistedDefaults();
+    // Leave malformed settings untouched; Pi remains usable and can report the
+    // malformed file through its normal settings handling.
+    return persistedDefaults();
+  }
+}
+
+function savePersistedConfig(): void {
+  const config = state.config;
+  const path = join(getAgentDir(), "settings.json");
+  let settings: Record<string, unknown> = {};
+  try {
+    settings = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw new Error(`Could not read ${path}: ${error.message}`);
+  }
+
+  settings[WORKER_SETTINGS_KEY] = {
+    ...(config.brainModel ? { brainModel: config.brainModel } : {}),
+    ...(config.brainThinking ? { brainThinking: config.brainThinking } : {}),
+    ...(config.workerModel ? { workerModel: config.workerModel } : {}),
+    ...(config.workerThinking ? { workerThinking: config.workerThinking } : {}),
+    ...(config.defaultRole ? { defaultRole: config.defaultRole } : {}),
+    ...(config.maxConcurrent !== DEFAULT_MAX_CONCURRENT ? { maxConcurrent: config.maxConcurrent } : {}),
   };
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+}
 
-  const startWorker = async (ctx: ExtensionContext): Promise<WorkerHandle> => {
+// ---------------------------------------------------------------------------
+// Delegation scheduler
+// ---------------------------------------------------------------------------
+
+function normalizeScopes(paths: string[] | undefined, cwd: string): string[] {
+  return [...new Set((paths ?? []).map((path) => resolve(cwd, path)))];
+}
+
+function scopesOverlap(left: string[], right: string[]): boolean {
+  // An omitted/empty scope is exclusive: it may not overlap any active task.
+  if (left.length === 0 || right.length === 0) return true;
+  const contains = (parent: string, child: string) => child === parent || child.startsWith(`${parent}/`);
+  return left.some((leftPath) =>
+    right.some((rightPath) => contains(leftPath, rightPath) || contains(rightPath, leftPath)),
+  );
+}
+
+async function runDelegation(record: ActiveDelegation) {
+  const { job, role } = record;
+  const ctx = job.ctx;
+  const config = state.config;
+  try {
     if (process.env.HERDR_ENV !== "1") {
       throw new Error("Brain mode requires pi to run inside a Herdr-managed pane (HERDR_ENV=1).");
     }
-    if (worker) return worker;
+    const modelRequested = role.model ?? config.workerModel ?? currentModelId(ctx);
+    let model = modelRequested;
+    if (modelRequested) {
+      const found = findModel(ctx, modelRequested);
+      if (!found) throw new Error(`Subagent model not found or unavailable: ${modelRequested}`);
+      model = `${found.provider}/${found.id}`;
+    }
+    const thinking = role.thinking ?? config.workerThinking ?? ctx.thinkingLevel;
 
-    const name = `pi-worker-${Date.now().toString(36)}`;
     const created = parseJson<{
-      result?: {
-        tab?: { tab_id?: string };
-        root_pane?: { pane_id?: string };
-      };
-    }>(runHerdr(["tab", "create", "--cwd", ctx.cwd, "--label", name, "--no-focus"]));
-    const tabId = created.result?.tab?.tab_id;
-    const paneId = created.result?.root_pane?.pane_id;
-    if (!tabId || !paneId) throw new Error("Could not create a Herdr worker tab.");
-    const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
-    const model = modelArgument(ctx, config.workerModel);
-    if (model) startArgs.push("--model", model);
-    if (config.workerThinking ?? ctx.thinkingLevel) startArgs.push("--thinking", config.workerThinking ?? ctx.thinkingLevel);
-    startArgs.push("--append-system-prompt", WORKER_SYSTEM_PROMPT);
+      result?: { tab?: { tab_id?: string }; root_pane?: { pane_id?: string } };
+    }>(runHerdr(["tab", "create", "--cwd", ctx.cwd, "--label", record.name, "--no-focus"]));
+    record.tabId = created.result?.tab?.tab_id;
+    record.paneId = created.result?.root_pane?.pane_id;
+    if (!record.tabId || !record.paneId) throw new Error("Could not create a Herdr subagent tab.");
+    refreshStatus();
 
-    try {
-      await waitForShell(startArgs, paneId);
-    } catch (error) {
-      closeWorker({ name, paneId, tabId });
-      throw error;
+    const startArgs = ["agent", "start", record.name, "--kind", "pi", "--pane", record.paneId, "--"];
+    startArgs.push(...rolePiArgs(role, model, thinking, record.name));
+    await waitForShell(startArgs, record.paneId);
+
+    const timeout = job.args.timeout ?? DEFAULT_WORKER_TIMEOUT;
+    await runHerdrAsync(
+      ["agent", "prompt", record.name, job.args.prompt, "--wait", "--timeout", String(timeout)],
+      timeout + 30000,
+    );
+    const report = await runHerdrAsync([
+      "agent",
+      "read",
+      record.name,
+      "--source",
+      "recent-unwrapped",
+      "--lines",
+      "200",
+    ]);
+    job.resolve(report);
+  } catch (error) {
+    job.reject(error);
+  } finally {
+    // Close the tab on every path — including a mid-flight mode switch or
+    // session reload — so no Herdr tab is ever leaked.
+    closeTab(record);
+    const index = state.activeDelegations.indexOf(record);
+    if (index >= 0) state.activeDelegations.splice(index, 1);
+    refreshStatus();
+    pumpDelegations();
+  }
+}
+
+function pumpDelegations() {
+  for (let index = 0; index < state.pendingDelegations.length; ) {
+    if (state.activeDelegations.length >= state.config.maxConcurrent) break;
+    const job = state.pendingDelegations[index]!;
+    if (state.activeDelegations.some((active) => scopesOverlap(active.job.scopes, job.scopes))) {
+      index += 1;
+      continue;
     }
+    state.pendingDelegations.splice(index, 1);
+    const record: ActiveDelegation = { job, role: job.role, name: spawnName(job.role.name) };
+    state.activeDelegations.push(record);
+    void runDelegation(record);
+  }
+  refreshStatus();
+}
 
-    worker = { name, paneId, tabId };
-    applyStatus(ctx, config, worker);
-    return worker;
-  };
+function delegate(ctx: ExtensionContext, args: WorkerDelegateArgs): Promise<string> {
+  if (state.config.mode !== "brain") {
+    return Promise.reject(new Error("Brain mode is not active. Run /worker-config mode brain first."));
+  }
+  if (!args.prompt.trim()) return Promise.reject(new Error("A worker prompt is required."));
+  // Resolve the role before queueing so an unknown name warns immediately.
+  const { role, fellBack } = resolveRole(ctx, args.role);
+  if (fellBack) {
+    notify(ctx, `Unknown worker role "${args.role ?? state.config.defaultRole}". Using generic worker.`, "warning");
+  }
 
-  const delegate = async (ctx: ExtensionContext, args: WorkerDelegateArgs) => {
-    if (config.mode !== "brain") {
-      throw new Error("Brain mode is not active. Run /worker-config mode brain first.");
-    }
-    if (!args.prompt.trim()) throw new Error("A worker prompt is required.");
-
-    const run = workerQueue.then(async () => {
-      const active = await startWorker(ctx);
-      const timeout = args.timeout ?? DEFAULT_WORKER_TIMEOUT;
-      runHerdr(["agent", "prompt", active.name, args.prompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
-      const report = runHerdr(["agent", "read", active.name, "--source", "recent-unwrapped", "--lines", "200"]);
-      // Optionally tear down the worker (agent + Herdr pane) once the task is done.
-      // The next delegation will spawn a fresh worker on demand.
-      if (args.closeAfter) await stopWorker(ctx);
-      return report;
+  return new Promise<string>((resolveJob, rejectJob) => {
+    state.pendingDelegations.push({
+      args,
+      ctx,
+      scopes: normalizeScopes(args.paths, ctx.cwd),
+      role,
+      resolve: resolveJob,
+      reject: rejectJob,
     });
-    workerQueue = run.catch(() => undefined);
-    return run;
+    pumpDelegations();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Settings mutations
+// ---------------------------------------------------------------------------
+
+async function setBrainModel(requested: string, ctx: ExtensionContext): Promise<void> {
+  const model = findModel(ctx, requested);
+  if (!model) throw new Error(`Model not found: ${requested}`);
+  if (!(await state.pi!.setModel(model))) throw new Error(`Pi could not authenticate model: ${requested}`);
+  state.config.brainModel = `${model.provider}/${model.id}`;
+  savePersistedConfig();
+}
+
+function setBrainThinking(level: ThinkingLevel): void {
+  state.pi!.setThinkingLevel(level);
+  state.config.brainThinking = level;
+  savePersistedConfig();
+}
+
+function setMode(mode: Mode, ctx: ExtensionContext): void {
+  if (mode === "brain" && process.env.HERDR_ENV !== "1") {
+    throw new Error("Brain mode requires pi to run inside a Herdr-managed pane (HERDR_ENV=1).");
+  }
+  if (mode === state.config.mode) return;
+  if (mode === "brain") {
+    state.config.mode = "brain";
+    const roles = [...discoverRoles(ctx).keys()];
+    notify(
+      ctx,
+      `Brain mode enabled. This session is now the orchestrator: plan and delegate with worker_delegate. Each delegation spawns a one-shot subagent (roles: ${roles.join(", ")}) in its own Herdr tab, reads its report, and closes the tab. Your own mutation tools are blocked.`,
+    );
+  } else {
+    state.config.mode = "regular";
+    const active = state.activeDelegations.length;
+    notify(
+      ctx,
+      active > 0
+        ? `Regular mode enabled. ${active} subagent(s) still running; their tabs close when they finish. This session works directly again.`
+        : "Regular mode enabled. This session works directly again.",
+    );
+  }
+  applyStatus(ctx);
+}
+
+// Worker model/thinking are defaults for future spawns; there is no live
+// worker to restart, so a change only needs to be recorded.
+function applyWorkerSetting(key: "worker-model" | "worker-thinking", value: string, ctx: ExtensionContext): void {
+  if (key === "worker-model") {
+    if (!findModel(ctx, value)) throw new Error(`Model not found or unavailable: ${value}`);
+    state.config.workerModel = value;
+  } else {
+    state.config.workerThinking = value as ThinkingLevel;
+  }
+  savePersistedConfig();
+}
+
+// ---------------------------------------------------------------------------
+// Interactive settings UI
+// ---------------------------------------------------------------------------
+
+// A SelectList wrapped with a live search box. Typing filters items by
+// substring (case-insensitive) against the label; backspace edits the query.
+// Navigation/confirm/cancel keys pass through to the underlying list.
+function searchableSelect(
+  allItems: SelectItem[],
+  current: string,
+  done: (selected?: string) => void,
+): Component {
+  let query = "";
+  const theme = getSelectListTheme();
+
+  const filtered = (): SelectItem[] => {
+    if (!query) return allItems;
+    const needle = query.toLowerCase();
+    return allItems.filter(
+      (item) => item.label.toLowerCase().includes(needle) || item.value.toLowerCase().includes(needle),
+    );
   };
 
-  const setBrainModel = async (requested: string, ctx: ExtensionContext) => {
-    const model = findModel(ctx, requested);
-    if (!model) throw new Error(`Model not found: ${requested}`);
-    if (!(await pi.setModel(model))) throw new Error(`Pi could not authenticate model: ${requested}`);
-    config.brainModel = `${model.provider}/${model.id}`;
-  };
+  let list = new SelectList(allItems, Math.min(allItems.length, 12), theme);
+  const preselect = allItems.findIndex((item) => item.value === current);
+  if (preselect >= 0) list.setSelectedIndex(preselect);
+  list.onSelect = (item) => done(item.value);
+  list.onCancel = () => done(undefined);
 
-  const setMode = async (mode: Mode, ctx: ExtensionContext) => {
-    if (mode === config.mode) {
-      if (mode === "brain") await startWorker(ctx);
-      applyStatus(ctx, config, worker);
-      return;
-    }
-
-    if (mode === "brain") {
-      config.mode = "brain";
-      try {
-        await startWorker(ctx);
-      } catch (error: any) {
-        config.mode = "regular";
-        applyStatus(ctx, config, worker);
-        throw new Error(error.message);
-      }
-      notify(
-        ctx,
-        "Brain mode enabled. This session is now the orchestrator (brain): plan and delegate all implementation and validation to the spawned worker with worker_delegate. Your own mutation tools are blocked.",
-      );
-    } else {
-      config.mode = "regular";
-      await stopWorker(ctx);
-      notify(ctx, "Regular mode enabled. This session works directly again; the worker and its Herdr pane have been closed.");
-    }
-    applyStatus(ctx, config, worker);
-  };
-
-  const setBrainThinking = (level: ThinkingLevel) => {
-    pi.setThinkingLevel(level);
-    config.brainThinking = level;
-  };
-
-  // Apply a worker model/thinking change and restart the worker if it is live,
-  // so the new settings take effect on the next delegation.
-  const applyWorkerSetting = async (
-    key: "worker-model" | "worker-thinking",
-    value: string,
-    ctx: ExtensionContext,
-  ) => {
-    if (key === "worker-model") config.workerModel = value;
-    else config.workerThinking = value as ThinkingLevel;
-    if (config.mode === "brain") {
-      await stopWorker(ctx);
-      await startWorker(ctx);
-    }
-  };
-
-  // A SelectList wrapped with a live search box. Typing filters items by
-  // substring (case-insensitive) against the label; backspace edits the query.
-  // Navigation/confirm/cancel keys pass through to the underlying list.
-  const searchableSelect = (
-    allItems: SelectItem[],
-    current: string,
-    done: (selected?: string) => void,
-  ): Component => {
-    let query = "";
-    const theme = getSelectListTheme();
-
-    const filtered = (): SelectItem[] => {
-      if (!query) return allItems;
-      const needle = query.toLowerCase();
-      return allItems.filter(
-        (item) =>
-          item.label.toLowerCase().includes(needle) ||
-          item.value.toLowerCase().includes(needle),
-      );
-    };
-
-    let list = new SelectList(allItems, Math.min(allItems.length, 12), theme);
-    const preselect = allItems.findIndex((item) => item.value === current);
-    if (preselect >= 0) list.setSelectedIndex(preselect);
+  const rebuild = () => {
+    const items = filtered();
+    list = new SelectList(items, Math.min(Math.max(items.length, 1), 12), theme);
     list.onSelect = (item) => done(item.value);
     list.onCancel = () => done(undefined);
+  };
 
-    const rebuild = () => {
-      const items = filtered();
-      list = new SelectList(items, Math.min(Math.max(items.length, 1), 12), theme);
-      list.onSelect = (item) => done(item.value);
-      list.onCancel = () => done(undefined);
-    };
-
-    return {
-      render(width: number): string[] {
-        const label = query.length ? query : "(type to search)";
-        const searchLine = truncateToWidth(`  🔍 ${label}`, width);
-        return [searchLine, ...list.render(width)];
-      },
-      invalidate() {
-        list.invalidate();
-      },
-      handleInput(data: string) {
-        // Backspace edits the query.
-        if (matchesKey(data, Key.backspace)) {
-          if (query.length) {
-            query = query.slice(0, -1);
-            rebuild();
-          }
-          return;
-        }
-        // Printable single characters extend the query. Navigation, enter, and
-        // escape (multi-byte or control sequences) fall through to the list.
-        if (data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) !== 127) {
-          query += data;
+  return {
+    render(width: number): string[] {
+      const label = query.length ? query : "(type to search)";
+      const searchLine = truncateToWidth(`  🔍 ${label}`, width);
+      return [searchLine, ...list.render(width)];
+    },
+    invalidate() {
+      list.invalidate();
+    },
+    handleInput(data: string) {
+      // Backspace edits the query.
+      if (matchesKey(data, Key.backspace)) {
+        if (query.length) {
+          query = query.slice(0, -1);
           rebuild();
+        }
+        return;
+      }
+      // Printable single characters extend the query. Navigation, enter, and
+      // escape (multi-byte or control sequences) fall through to the list.
+      if (data.length === 1 && data.charCodeAt(0) >= 32 && data.charCodeAt(0) !== 127) {
+        query += data;
+        rebuild();
+        return;
+      }
+      list.handleInput(data);
+    },
+  };
+}
+
+// Build a SelectList submenu factory for picking a model from the registry.
+function modelSubmenu(ctx: ExtensionContext, includeInherit: boolean) {
+  return (current: string, done: (selected?: string) => void): Component => {
+    const available = ctx.modelRegistry.getAvailable();
+    const items: SelectItem[] = [];
+    if (includeInherit) {
+      items.push({
+        value: "__inherit__",
+        label: "(inherit brain model)",
+        description: "Use the same model as the brain session",
+      });
+    }
+    for (const model of available) {
+      const id = `${model.provider}/${model.id}`;
+      items.push({ value: id, label: id, description: model.provider });
+    }
+
+    return searchableSelect(items, current, done);
+  };
+}
+
+// Build a SelectList submenu factory for picking a thinking level.
+function thinkingSubmenu(includeInherit: boolean) {
+  return (current: string, done: (selected?: string) => void): Component => {
+    const items: SelectItem[] = [];
+    if (includeInherit) {
+      items.push({
+        value: "__inherit__",
+        label: "(inherit brain level)",
+        description: "Use the same thinking level as the brain session",
+      });
+    }
+    for (const level of THINKING_ORDER) items.push({ value: level, label: level });
+
+    const list = new SelectList(items, items.length, getSelectListTheme());
+    const currentIndex = items.findIndex((item) => item.value === current);
+    if (currentIndex >= 0) list.setSelectedIndex(currentIndex);
+    list.onSelect = (item) => done(item.value);
+    list.onCancel = () => done(undefined);
+    return list;
+  };
+}
+
+// Build a SelectList submenu factory for picking a default role.
+function roleSubmenu(ctx: ExtensionContext) {
+  return (current: string, done: (selected?: string) => void): Component => {
+    const roles = [...discoverRoles(ctx).values()].filter((role) => role.name !== BUILTIN_WORKER_NAME);
+    const items: SelectItem[] = [
+      {
+        value: "",
+        label: `${BUILTIN_WORKER_NAME} (generic)`,
+        description: "Built-in one-shot worker prompt",
+      },
+      ...roles.map((role) => ({
+        value: role.name,
+        label: role.name,
+        description: role.description,
+      })),
+    ];
+    const list = new SelectList(items, Math.min(items.length, 12), getSelectListTheme());
+    const currentIndex = items.findIndex((item) => item.value === current);
+    if (currentIndex >= 0) list.setSelectedIndex(currentIndex);
+    list.onSelect = (item) => done(item.value);
+    list.onCancel = () => done(undefined);
+    return list;
+  };
+}
+
+async function openSettingsUI(ctx: ExtensionContext): Promise<void> {
+  const config = state.config;
+  // Draft state: edits are collected here and only applied to the live config
+  // when the user presses Ctrl+S. Esc discards the draft.
+  type Draft = {
+    mode: Mode;
+    brainModel?: string;
+    brainThinking?: ThinkingLevel;
+    workerModel?: string;
+    workerThinking?: ThinkingLevel;
+    defaultRole?: string;
+    maxConcurrent: number;
+  };
+  const draft: Draft = {
+    mode: config.mode,
+    brainModel: config.brainModel,
+    brainThinking: config.brainThinking,
+    workerModel: config.workerModel,
+    workerThinking: config.workerThinking,
+    defaultRole: config.defaultRole,
+    maxConcurrent: config.maxConcurrent,
+  };
+
+  const brainModelDisplay = () => draft.brainModel ?? currentModelId(ctx) ?? "current";
+  const brainThinkingDisplay = () => draft.brainThinking ?? ctx.thinkingLevel ?? "current";
+  const workerModelDisplay = () => draft.workerModel ?? "(inherit brain model)";
+  const workerThinkingDisplay = () => draft.workerThinking ?? "(inherit brain level)";
+  const defaultRoleDisplay = () => draft.defaultRole ?? `${BUILTIN_WORKER_NAME} (generic)`;
+
+  const isDirty = () =>
+    draft.mode !== config.mode ||
+    draft.brainModel !== config.brainModel ||
+    draft.brainThinking !== config.brainThinking ||
+    draft.workerModel !== config.workerModel ||
+    draft.workerThinking !== config.workerThinking ||
+    draft.defaultRole !== config.defaultRole ||
+    draft.maxConcurrent !== config.maxConcurrent;
+
+  // Apply the draft to the live config. Subagent defaults only affect future
+  // spawns, so there is nothing to restart; mode may still need its Herdr check.
+  const saveDraft = async () => {
+    const brainModelChanged = draft.brainModel !== config.brainModel;
+    const brainThinkingChanged = draft.brainThinking !== config.brainThinking;
+    if (brainModelChanged && draft.brainModel) {
+      await setBrainModel(draft.brainModel, ctx);
+    } else if (brainModelChanged) {
+      config.brainModel = undefined;
+    }
+    if (brainThinkingChanged && draft.brainThinking) {
+      setBrainThinking(draft.brainThinking);
+    } else if (brainThinkingChanged) {
+      config.brainThinking = undefined;
+    }
+
+    if (draft.workerModel && !findModel(ctx, draft.workerModel)) {
+      throw new Error(`Model not found or unavailable: ${draft.workerModel}`);
+    }
+    config.workerModel = draft.workerModel;
+    config.workerThinking = draft.workerThinking;
+    config.defaultRole = draft.defaultRole;
+    config.maxConcurrent = draft.maxConcurrent;
+    savePersistedConfig();
+
+    if (draft.mode !== config.mode) {
+      setMode(draft.mode, ctx);
+    }
+
+    applyStatus(ctx);
+  };
+
+  await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+    const container = new Container();
+    const header = new Text(theme.fg("accent", theme.bold("Herdr Worker Settings")), 1, 1);
+    container.addChild(header);
+
+    const items: SettingItem[] = [
+      {
+        id: "mode",
+        label: "Mode",
+        description: "regular = work directly; brain = delegate to one-shot subagents",
+        currentValue: draft.mode,
+        values: ["regular", "brain"],
+      },
+      {
+        id: "brain-model",
+        label: "Brain model",
+        description: "Model for this orchestrator session (enter to pick)",
+        currentValue: brainModelDisplay(),
+        submenu: modelSubmenu(ctx, false),
+      },
+      {
+        id: "brain-thinking",
+        label: "Brain thinking",
+        description: "Thinking level for this orchestrator session",
+        currentValue: brainThinkingDisplay(),
+        submenu: thinkingSubmenu(false),
+      },
+      {
+        id: "worker-model",
+        label: "Subagent model",
+        description: "Default model for spawned subagents; a role file may override (enter to pick)",
+        currentValue: workerModelDisplay(),
+        submenu: modelSubmenu(ctx, true),
+      },
+      {
+        id: "worker-thinking",
+        label: "Subagent thinking",
+        description: "Default thinking level for spawned subagents; a role file may override",
+        currentValue: workerThinkingDisplay(),
+        submenu: thinkingSubmenu(true),
+      },
+      {
+        id: "default-role",
+        label: "Default role",
+        description: "Role used when worker_delegate omits role (from .pi/agents/*.md; enter to pick)",
+        currentValue: defaultRoleDisplay(),
+        submenu: roleSubmenu(ctx),
+      },
+      {
+        id: "max-concurrent",
+        label: "Max concurrent",
+        description: "Upper bound on subagents running at once (disjoint path scopes parallelize)",
+        currentValue: String(draft.maxConcurrent),
+        values: CONCURRENT_CHOICES,
+      },
+      {
+        id: "reset",
+        label: "Reset overrides",
+        description: "Clear brain/subagent model, thinking, default role, and concurrency (in draft)",
+        currentValue: "press enter",
+        values: ["press enter", "reset"],
+      },
+    ];
+
+    const helpLine = new Text("", 1, 0);
+    const refreshHelp = () => {
+      const status = isDirty()
+        ? theme.fg("warning", "● unsaved changes")
+        : theme.fg("success", "● saved");
+      helpLine.setText(
+        `${status}  ${theme.fg("dim", "↑↓ navigate · enter cycle/pick · ctrl+s save · esc discard")}`,
+      );
+    };
+
+    const settingsList = new SettingsList(
+      items,
+      Math.min(items.length + 2, 15),
+      getSettingsListTheme(),
+      (id, newValue) => {
+        // Mutate the draft only — no live application here.
+        if (id === "mode") {
+          if (newValue === "regular" || newValue === "brain") draft.mode = newValue;
+          settingsList.updateValue("mode", draft.mode);
+        } else if (id === "brain-model") {
+          draft.brainModel = newValue;
+          settingsList.updateValue("brain-model", brainModelDisplay());
+        } else if (id === "brain-thinking") {
+          if (validThinking(newValue)) draft.brainThinking = newValue;
+          settingsList.updateValue("brain-thinking", brainThinkingDisplay());
+        } else if (id === "worker-model") {
+          draft.workerModel = newValue === "__inherit__" ? undefined : newValue;
+          settingsList.updateValue("worker-model", workerModelDisplay());
+        } else if (id === "worker-thinking") {
+          if (newValue === "__inherit__") draft.workerThinking = undefined;
+          else if (validThinking(newValue)) draft.workerThinking = newValue;
+          settingsList.updateValue("worker-thinking", workerThinkingDisplay());
+        } else if (id === "default-role") {
+          draft.defaultRole = newValue || undefined;
+          settingsList.updateValue("default-role", defaultRoleDisplay());
+        } else if (id === "max-concurrent") {
+          const parsed = Number(newValue);
+          if (Number.isFinite(parsed) && parsed >= 1) draft.maxConcurrent = Math.floor(parsed);
+          settingsList.updateValue("max-concurrent", String(draft.maxConcurrent));
+        } else if (id === "reset") {
+          if (newValue === "reset") {
+            draft.brainModel = undefined;
+            draft.brainThinking = undefined;
+            draft.workerModel = undefined;
+            draft.workerThinking = undefined;
+            draft.defaultRole = undefined;
+            draft.maxConcurrent = DEFAULT_MAX_CONCURRENT;
+            settingsList.updateValue("brain-model", brainModelDisplay());
+            settingsList.updateValue("brain-thinking", brainThinkingDisplay());
+            settingsList.updateValue("worker-model", workerModelDisplay());
+            settingsList.updateValue("worker-thinking", workerThinkingDisplay());
+            settingsList.updateValue("default-role", defaultRoleDisplay());
+            settingsList.updateValue("max-concurrent", String(draft.maxConcurrent));
+          }
+          settingsList.updateValue("reset", "press enter");
+        }
+        refreshHelp();
+        tui.requestRender();
+      },
+      () => done(undefined),
+    );
+    container.addChild(settingsList);
+    container.addChild(helpLine);
+    refreshHelp();
+
+    let saving = false;
+    return {
+      render: (w) => container.render(w),
+      invalidate: () => container.invalidate(),
+      handleInput: (data) => {
+        // Ctrl+S saves the draft. Intercept before the list so it is not
+        // treated as a printable character by an active search box.
+        if (matchesKey(data, Key.ctrl("s"))) {
+          if (saving || !isDirty()) return;
+          saving = true;
+          void (async () => {
+            try {
+              await saveDraft();
+              notify(ctx, "Worker settings saved.");
+              refreshHelp();
+            } catch (error: any) {
+              notify(ctx, error.message, "error");
+            } finally {
+              saving = false;
+              tui.requestRender();
+            }
+          })();
           return;
         }
-        list.handleInput(data);
+        settingsList.handleInput?.(data);
+        tui.requestRender();
       },
     };
-  };
+  });
+}
 
-  // Build a SelectList submenu factory for picking a model from the registry.
-  const modelSubmenu =
-    (ctx: ExtensionContext, includeInherit: boolean) =>
-    (current: string, done: (selected?: string) => void): Component => {
-      const available = ctx.modelRegistry.getAvailable();
-      const items: SelectItem[] = [];
-      if (includeInherit) {
-        items.push({
-          value: "__inherit__",
-          label: "(inherit brain model)",
-          description: "Use the same model as the brain session",
-        });
+// ---------------------------------------------------------------------------
+// Temporary one-shot spawning (/spawn, /spawnp, spawn_pi)
+// ---------------------------------------------------------------------------
+
+function parseSpawnArgs(
+  args: string,
+): { prompt: string; name?: string; model?: string; role?: string; thinking?: string; timeout: number } {
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  const promptTokens: string[] = [];
+  let name: string | undefined;
+  let model: string | undefined;
+  let role: string | undefined;
+  let thinking: string | undefined;
+  let timeout = 120000;
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token === "--name" || token === "--model" || token === "--timeout" || token === "--role" || token === "--thinking") {
+      const value = tokens[++index];
+      if (!value) throw new Error(`${token} requires a value`);
+      if (token === "--name") name = value;
+      else if (token === "--model") model = value;
+      else if (token === "--role") role = value;
+      else if (token === "--thinking") {
+        if (!validThinking(value)) throw new Error(`invalid thinking level: ${value}`);
+        thinking = value;
+      } else timeout = Number(value);
+    } else {
+      promptTokens.push(token);
+    }
+  }
+
+  if (!Number.isFinite(timeout) || timeout <= 0) throw new Error("--timeout must be a positive number");
+  return { prompt: promptTokens.join(" "), name, model, role, thinking, timeout };
+}
+
+type OneShotArgs = {
+  prompt: string;
+  name?: string;
+  model?: string;
+  role?: string;
+  thinking?: string;
+  timeout: number;
+};
+
+/** Resolve a role's pi flags without an ExtensionContext (model stays verbatim). */
+function roleFlagsFor(role: RoleDef, ctx: ExtensionContext | undefined, model?: string, thinking?: string): string[] {
+  const flags: string[] = [];
+  const resolvedModel = model ?? role.model;
+  if (resolvedModel) {
+    const available = ctx ? findModel(ctx, resolvedModel) : undefined;
+    flags.push("--model", available ? `${available.provider}/${available.id}` : resolvedModel);
+  }
+  const resolvedThinking = thinking ?? role.thinking;
+  if (resolvedThinking) flags.push("--thinking", resolvedThinking);
+  if (role.tools) flags.push("--tools", role.tools);
+  flags.push("--append-system-prompt", roleSystemPrompt(role));
+  return flags;
+}
+
+async function runOneShot(parsed: OneShotArgs, ctx: ExtensionContext | undefined, cwd: string, direction = "right"): Promise<string> {
+  if (process.env.HERDR_ENV !== "1") return "Failed: Not running in Herdr environment. Cannot spawn pane.";
+  const name = parsed.name ?? `pi-${Date.now().toString(36)}`;
+  let paneId: string | undefined;
+  try {
+    const split = parseJson<{ result?: { pane?: { pane_id?: string } } }>(
+      runHerdr(["pane", "split", "--current", "--direction", direction, "--cwd", cwd, "--no-focus"]),
+    );
+    paneId = split.result?.pane?.pane_id;
+    if (!paneId) throw new Error("Could not create new pane");
+    const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
+    if (parsed.role && ctx) {
+      startArgs.push(...roleFlagsFor(resolveRole(ctx, parsed.role).role, ctx, parsed.model, parsed.thinking));
+    } else {
+      if (parsed.model) startArgs.push("--model", parsed.model);
+      if (parsed.thinking) startArgs.push("--thinking", parsed.thinking);
+    }
+    await waitForShell(startArgs, paneId);
+    runHerdr(["agent", "prompt", name, parsed.prompt, "--wait", "--timeout", String(parsed.timeout)], parsed.timeout + 30000);
+    const response = runHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "100"]);
+    return `Agent ${name} completed in pane ${paneId}\n\n${response}`;
+  } catch (error: any) {
+    return `Failed: ${error.message}`;
+  } finally {
+    if (paneId) {
+      try {
+        runHerdr(["pane", "close", paneId]);
+      } catch {
+        // best effort cleanup
       }
-      for (const model of available) {
-        const id = `${model.provider}/${model.id}`;
-        items.push({ value: id, label: id, description: model.provider });
-      }
+    }
+  }
+}
 
-      return searchableSelect(items, current, done);
-    };
+// ---------------------------------------------------------------------------
+// Extension entry point
+// ---------------------------------------------------------------------------
 
-  // Build a SelectList submenu factory for picking a thinking level.
-  const thinkingSubmenu =
-    (includeInherit: boolean) =>
-    (current: string, done: (selected?: string) => void): Component => {
-      const items: SelectItem[] = [];
-      if (includeInherit) {
-        items.push({
-          value: "__inherit__",
-          label: "(inherit brain level)",
-          description: "Use the same thinking level as the brain session",
-        });
-      }
-      for (const level of THINKING_ORDER) items.push({ value: level, label: level });
-
-      const list = new SelectList(items, items.length, getSelectListTheme());
-      const currentIndex = items.findIndex((item) => item.value === current);
-      if (currentIndex >= 0) list.setSelectedIndex(currentIndex);
-      list.onSelect = (item) => done(item.value);
-      list.onCancel = () => done(undefined);
-      return list;
-    };
-
-  const openSettingsUI = async (ctx: ExtensionContext) => {
-    // Draft state: edits are collected here and only applied to the live config
-    // (and the worker) when the user presses Ctrl+S. Esc discards the draft.
-    type Draft = {
-      mode: Mode;
-      brainModel?: string;
-      brainThinking?: ThinkingLevel;
-      workerModel?: string;
-      workerThinking?: ThinkingLevel;
-    };
-    const draft: Draft = {
-      mode: config.mode,
-      brainModel: config.brainModel,
-      brainThinking: config.brainThinking,
-      workerModel: config.workerModel,
-      workerThinking: config.workerThinking,
-    };
-
-    const brainModelDisplay = () => draft.brainModel ?? currentModelId(ctx) ?? "current";
-    const brainThinkingDisplay = () => draft.brainThinking ?? ctx.thinkingLevel ?? "current";
-    const workerModelDisplay = () => draft.workerModel ?? "(inherit brain model)";
-    const workerThinkingDisplay = () => draft.workerThinking ?? "(inherit brain level)";
-
-    const isDirty = () =>
-      draft.mode !== config.mode ||
-      draft.brainModel !== config.brainModel ||
-      draft.brainThinking !== config.brainThinking ||
-      draft.workerModel !== config.workerModel ||
-      draft.workerThinking !== config.workerThinking;
-
-    // Apply the draft to the live config and reconcile the worker/model/thinking.
-    const saveDraft = async () => {
-      // Brain model: authenticate and switch the current session's model.
-      if (draft.brainModel !== config.brainModel && draft.brainModel) {
-        await setBrainModel(draft.brainModel, ctx);
-      }
-      // Brain thinking level applies to this session.
-      if (draft.brainThinking !== config.brainThinking && draft.brainThinking) {
-        setBrainThinking(draft.brainThinking);
-      }
-
-      // Worker model/thinking only change stored config here; the worker is
-      // restarted once below if anything worker-affecting changed.
-      const workerChanged =
-        draft.workerModel !== config.workerModel || draft.workerThinking !== config.workerThinking;
-      config.workerModel = draft.workerModel;
-      config.workerThinking = draft.workerThinking;
-
-      // Mode change spawns or tears down the worker as needed.
-      if (draft.mode !== config.mode) {
-        await setMode(draft.mode, ctx);
-      } else if (workerChanged && config.mode === "brain") {
-        // Same mode but worker settings changed: restart the live worker so the
-        // new model/thinking take effect on the next delegation.
-        await stopWorker(ctx);
-        await startWorker(ctx);
-      }
-
-      applyStatus(ctx, config, worker);
-    };
-
-    await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-      const container = new Container();
-      const header = new Text(theme.fg("accent", theme.bold("Herdr Worker Settings")), 1, 1);
-      container.addChild(header);
-
-      const items: SettingItem[] = [
-        {
-          id: "mode",
-          label: "Mode",
-          description: "regular = work directly; brain = orchestrate a spawned worker",
-          currentValue: draft.mode,
-          values: ["regular", "brain"],
-        },
-        {
-          id: "brain-model",
-          label: "Brain model",
-          description: "Model for this orchestrator session (enter to pick)",
-          currentValue: brainModelDisplay(),
-          submenu: modelSubmenu(ctx, false),
-        },
-        {
-          id: "brain-thinking",
-          label: "Brain thinking",
-          description: "Thinking level for this orchestrator session",
-          currentValue: brainThinkingDisplay(),
-          submenu: thinkingSubmenu(false),
-        },
-        {
-          id: "worker-model",
-          label: "Worker model",
-          description: "Model used by the spawned worker (enter to pick)",
-          currentValue: workerModelDisplay(),
-          submenu: modelSubmenu(ctx, true),
-        },
-        {
-          id: "worker-thinking",
-          label: "Worker thinking",
-          description: "Thinking level used by the spawned worker",
-          currentValue: workerThinkingDisplay(),
-          submenu: thinkingSubmenu(true),
-        },
-        {
-          id: "reset",
-          label: "Reset overrides",
-          description: "Clear brain/worker model and thinking overrides (in draft)",
-          currentValue: "press enter",
-          values: ["press enter", "reset"],
-        },
-      ];
-
-      const helpLine = new Text("", 1, 0);
-      const refreshHelp = () => {
-        const status = isDirty()
-          ? theme.fg("warning", "● unsaved changes")
-          : theme.fg("success", "● saved");
-        helpLine.setText(
-          `${status}  ${theme.fg("dim", "↑↓ navigate · enter cycle/pick · ctrl+s save · esc discard")}`,
-        );
-      };
-
-      const settingsList = new SettingsList(
-        items,
-        Math.min(items.length + 2, 15),
-        getSettingsListTheme(),
-        (id, newValue) => {
-          // Mutate the draft only — no live application here.
-          if (id === "mode") {
-            if (newValue === "regular" || newValue === "brain") draft.mode = newValue;
-            settingsList.updateValue("mode", draft.mode);
-          } else if (id === "brain-model") {
-            draft.brainModel = newValue;
-            settingsList.updateValue("brain-model", brainModelDisplay());
-          } else if (id === "brain-thinking") {
-            if (validThinking(newValue)) draft.brainThinking = newValue;
-            settingsList.updateValue("brain-thinking", brainThinkingDisplay());
-          } else if (id === "worker-model") {
-            draft.workerModel = newValue === "__inherit__" ? undefined : newValue;
-            settingsList.updateValue("worker-model", workerModelDisplay());
-          } else if (id === "worker-thinking") {
-            if (newValue === "__inherit__") draft.workerThinking = undefined;
-            else if (validThinking(newValue)) draft.workerThinking = newValue;
-            settingsList.updateValue("worker-thinking", workerThinkingDisplay());
-          } else if (id === "reset") {
-            if (newValue === "reset") {
-              draft.brainModel = undefined;
-              draft.brainThinking = undefined;
-              draft.workerModel = undefined;
-              draft.workerThinking = undefined;
-              settingsList.updateValue("brain-model", brainModelDisplay());
-              settingsList.updateValue("brain-thinking", brainThinkingDisplay());
-              settingsList.updateValue("worker-model", workerModelDisplay());
-              settingsList.updateValue("worker-thinking", workerThinkingDisplay());
-            }
-            settingsList.updateValue("reset", "press enter");
-          }
-          refreshHelp();
-          tui.requestRender();
-        },
-        () => done(undefined),
-      );
-      container.addChild(settingsList);
-      container.addChild(helpLine);
-      refreshHelp();
-
-      let saving = false;
-      return {
-        render: (w) => container.render(w),
-        invalidate: () => container.invalidate(),
-        handleInput: (data) => {
-          // Ctrl+S saves the draft. Intercept before the list so it is not
-          // treated as a printable character by an active search box.
-          if (matchesKey(data, Key.ctrl("s"))) {
-            if (saving || !isDirty()) return;
-            saving = true;
-            void (async () => {
-              try {
-                await saveDraft();
-                notify(ctx, "Worker settings saved.");
-                refreshHelp();
-              } catch (error: any) {
-                notify(ctx, error.message, "error");
-              } finally {
-                saving = false;
-                tui.requestRender();
-              }
-            })();
-            return;
-          }
-          settingsList.handleInput?.(data);
-          tui.requestRender();
-        },
-      };
-    });
-  };
+export default function herdrSpawn(pi: ExtensionAPI) {
+  state.pi = pi;
+  // A worker instance never orchestrates: session_start resets config to a
+  // regular-mode session, and tool_call gates worker_delegate by worker
+  // detection, so a stray delegation cannot spawn its own subagent.
 
   pi.on("session_start", async (_event, ctx) => {
-    config.mode = "regular";
-    worker = undefined;
-    applyStatus(ctx, config, worker);
-    notify(ctx, "Herdr worker ready in regular mode. Use /worker-config mode brain to make this session the orchestrator.");
+    // Mode is session-only; persisted model/thinking/role overrides are applied
+    // to the new session, but mode always starts as regular.
+    resetSessionState();
+    state.statusContexts.add(ctx);
+    if (!IS_WORKER_INSTANCE && state.config.brainModel) {
+      const model = findModel(ctx, state.config.brainModel);
+      if (model) {
+        if (!(await pi.setModel(model))) {
+          notify(ctx, `Could not authenticate persisted brain model: ${state.config.brainModel}`, "warning");
+        }
+      } else {
+        notify(ctx, `Persisted brain model is unavailable: ${state.config.brainModel}`, "warning");
+      }
+    }
+    if (!IS_WORKER_INSTANCE && state.config.brainThinking) pi.setThinkingLevel(state.config.brainThinking);
+    applyStatus(ctx);
+    if (!IS_WORKER_INSTANCE) {
+      notify(ctx, "Herdr worker ready in regular mode. Use /worker-config mode brain to delegate work to one-shot subagents.");
+    }
   });
 
   pi.on("session_shutdown", async () => {
-    closeWorker(worker);
-    worker = undefined;
+    for (const job of state.pendingDelegations.splice(0)) {
+      job.reject(new Error("Worker session shut down."));
+    }
+    // Owned subagent tabs are closed with the session. runDelegation's finally
+    // closes them too, so these calls are best-effort duplicates.
+    for (const record of state.activeDelegations) closeTab(record);
   });
 
-  pi.on("before_agent_start", async (event) => {
-    if (config.mode !== "brain") return;
+  pi.on("before_agent_start", async (event, ctx) => {
+    state.statusContexts.add(ctx);
+    if (IS_WORKER_INSTANCE) {
+      return {
+        systemPrompt: `${event.systemPrompt}\n\nSUBAGENT MODE: You are a one-time worker spawned by an orchestrator session. Execute delegated tasks directly in this repository. Do not delegate work to another agent and do not use worker_delegate or spawn commands. Your final message is captured automatically and returned to the orchestrator, so end your turn with a concise report: changes made, validation performed, any blockers.`,
+      };
+    }
+    if (state.config.mode !== "brain") return;
+    const roleNames = [...discoverRoles(ctx).keys()].join(", ");
+    const defaultRole = state.config.defaultRole ?? BUILTIN_WORKER_NAME;
     return {
-      systemPrompt: `${event.systemPrompt}\n\nBRAIN MODE (ORCHESTRATOR): This session has switched roles and is now the brain. You must exclusively orchestrate and delegate; you do not do implementation work yourself. Do not use write, edit, bash, apply_patch, patch, delete, or move tools. Delegate all implementation, testing, and other non-trivial work to the spawned worker with worker_delegate, then inspect and summarize the worker's report. Keep delegation prompts complete and specific.`,
+      systemPrompt: `${event.systemPrompt}\n\nBRAIN MODE (ORCHESTRATOR): This session has switched roles and is now the brain. You must exclusively orchestrate and delegate; you do not do implementation work yourself. Do not use write, edit, bash, apply_patch, patch, delete, or move tools. Delegate all implementation, testing, and other non-trivial work to one-shot subagents with worker_delegate, passing role to pick a persona (default: ${defaultRole}). Available roles, defined in .pi/agents/<name>.md: ${roleNames}. Each delegation spawns a fresh pi subagent in its own Herdr tab, waits for its report, and closes the tab; subagents have no memory of this conversation, so keep delegation prompts complete and self-contained. Tasks with disjoint paths may run concurrently on separate subagents; overlapping or omitted paths serialize. Inspect and summarize each worker report before deciding the next delegation.`,
     };
   });
 
   pi.on("tool_call", async (event) => {
-    if (config.mode === "brain" && MUTATING_TOOLS.has(event.toolName)) {
+    if (IS_WORKER_INSTANCE) {
+      // A spawned subagent must never orchestrate its own workers.
+      if (event.toolName === "worker_delegate" || MUTATING_TOOLS.has(event.toolName)) {
+        return {
+          block: true,
+          reason: `Blocked in subagent mode: ${event.toolName}. You are the worker — execute the task directly and report.`,
+        };
+      }
+      return;
+    }
+    if (state.config.mode === "brain" && MUTATING_TOOLS.has(event.toolName)) {
       return {
         block: true,
-        reason: `Blocked in brain mode: ${event.toolName} is a mutation tool. You are the orchestrator — delegate this work to the worker with worker_delegate.`,
+        reason: `Blocked in brain mode: ${event.toolName} is a mutation tool. You are the orchestrator — delegate this work to a subagent with worker_delegate.`,
       };
     }
   });
 
   pi.registerCommand("worker-config", {
-    description: "Open the worker settings UI, or configure it via subcommands (mode, brain-model, worker-model, thinking, close, reset)",
+    description:
+      "Open the worker settings UI, or configure it via subcommands (mode, default-role, max-concurrent, roles, brain-model, worker-model, thinking, reset)",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       // No arguments opens the interactive settings UI.
@@ -641,7 +1200,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
         return;
       }
       if (tokens[0] === "show") {
-        notify(ctx, describeConfig(config, worker, ctx));
+        notify(ctx, describeConfig(ctx));
         return;
       }
 
@@ -653,19 +1212,34 @@ export default function herdrSpawn(pi: ExtensionAPI) {
           return;
         } else if (key === "mode") {
           if (value !== "regular" && value !== "brain") throw new Error("Usage: /worker-config mode regular|brain");
-          await setMode(value, ctx);
-        } else if (key === "close" || key === "stop-worker") {
-          if (!worker) {
-            notify(ctx, "No worker is running.");
-          } else {
-            const name = worker.name;
-            await stopWorker(ctx);
-            notify(ctx, `Closed worker ${name} and its Herdr pane. Mode remains ${config.mode}; a new worker spawns on the next delegation.`);
-          }
+          setMode(value, ctx);
+        } else if (key === "default-role") {
+          if (!value) throw new Error("Usage: /worker-config default-role <role> (see /worker-config roles)");
+          state.roleCache = undefined;
+          const { role, fellBack } = resolveRole(ctx, value);
+          if (fellBack) throw new Error(`Unknown worker role "${value}". See /worker-config roles.`);
+          state.config.defaultRole = role.name === BUILTIN_WORKER_NAME ? undefined : role.name;
+          savePersistedConfig();
+          notify(ctx, `Default subagent role set to ${role.name}.`);
+        } else if (key === "max-concurrent") {
+          const parsed = Number(value);
+          if (!Number.isFinite(parsed) || parsed < 1) throw new Error("Usage: /worker-config max-concurrent <n> (n >= 1)");
+          state.config.maxConcurrent = Math.floor(parsed);
+          savePersistedConfig();
+          notify(ctx, `Max concurrent subagents set to ${state.config.maxConcurrent}.`);
+        } else if (key === "roles") {
+          state.roleCache = undefined;
+          const roles = [...discoverRoles(ctx).values()];
+          notify(
+            ctx,
+            roles
+              .map((role) => `- ${role.name}: ${role.description}${role.sourcePath ? ` (${role.sourcePath})` : ""}`)
+              .join("\n"),
+          );
         } else if (key === "brain-model") {
           if (!value) throw new Error("Usage: /worker-config brain-model <provider/model>");
           await setBrainModel(value, ctx);
-          notify(ctx, `Brain model set to ${config.brainModel}.`);
+          notify(ctx, `Brain model set to ${state.config.brainModel}.`);
         } else if (key === "brain-thinking") {
           if (!validThinking(value)) throw new Error("Usage: /worker-config brain-thinking <off|minimal|low|medium|high|xhigh|max>");
           setBrainThinking(value);
@@ -675,18 +1249,23 @@ export default function herdrSpawn(pi: ExtensionAPI) {
             throw new Error("Usage: /worker-config worker-thinking <off|minimal|low|medium|high|xhigh|max>");
           }
           if (!value) throw new Error(`Usage: /worker-config ${key} <value>`);
-          await applyWorkerSetting(key, value, ctx);
-          notify(ctx, `${key} set to ${value}.`);
+          applyWorkerSetting(key, value, ctx);
+          notify(ctx, `${key} set to ${value}. Takes effect on the next subagent spawn.`);
         } else if (key === "reset") {
-          config.brainModel = undefined;
-          config.brainThinking = undefined;
-          config.workerModel = undefined;
-          config.workerThinking = undefined;
+          state.config.brainModel = undefined;
+          state.config.brainThinking = undefined;
+          state.config.workerModel = undefined;
+          state.config.workerThinking = undefined;
+          state.config.defaultRole = undefined;
+          state.config.maxConcurrent = DEFAULT_MAX_CONCURRENT;
+          savePersistedConfig();
           notify(ctx, "Worker configuration reset. Mode remains unchanged.");
         } else {
-          throw new Error("Usage: /worker-config [ui|show|mode|close|brain-model|brain-thinking|worker-model|worker-thinking|reset] ... (run with no arguments to open the settings UI)");
+          throw new Error(
+            "Usage: /worker-config [ui|show|mode|default-role|max-concurrent|roles|brain-model|brain-thinking|worker-model|worker-thinking|reset] ... (run with no arguments to open the settings UI)",
+          );
         }
-        applyStatus(ctx, config, worker);
+        applyStatus(ctx);
       } catch (error: any) {
         notify(ctx, error.message, "error");
       }
@@ -697,19 +1276,19 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     name: "worker_delegate",
     label: "Worker Delegate",
     description:
-      "Delegate implementation, testing, review, or other non-trivial work to the spawned Herdr worker. Use this in brain mode: this session is the orchestrator and does not do the work itself. The worker persists across delegations by default; pass closeAfter: true to close the worker and its Herdr pane once the task completes.",
+      "Delegate implementation, testing, or review work to a freshly spawned one-shot pi subagent in its own Herdr tab. The subagent runs the task to completion, returns its report, and the tab is closed. Optional role selects a persona defined in .pi/agents/<role>.md (custom system prompt, model, thinking, tools); omit to use the configured default role. Use paths to declare files/directories the task may modify; disjoint paths run concurrently on separate subagents, while omitted paths are exclusive. Delegation prompts must be self-contained — subagents never see this conversation.",
     parameters: WorkerDelegateInput,
     async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
       try {
         const response = await delegate(ctx, input as WorkerDelegateArgs);
         return {
           content: [{ type: "text", text: response }],
-          details: { worker: worker?.name, mode: config.mode },
+          details: { mode: state.config.mode },
         };
       } catch (error: any) {
         return {
           content: [{ type: "text", text: error.message }],
-          details: { mode: config.mode },
+          details: { mode: state.config.mode },
           isError: true,
         };
       }
@@ -717,15 +1296,15 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("spawn", {
-    description: "Spawn a pi agent: /spawn <prompt> [--name <name>] [--model <model>] [--timeout <ms>]",
+    description: "Spawn a temporary pi agent: /spawn <prompt> [--name <name>] [--model <model>] [--role <role>] [--timeout <ms>]",
     handler: async (args, ctx) => {
       try {
         const parsed = parseSpawnArgs(args);
         if (!parsed.prompt) {
-          notify(ctx, "Usage: /spawn <prompt> [--name <name>] [--model <model>] [--timeout <ms>]", "error");
+          notify(ctx, "Usage: /spawn <prompt> [--name <name>] [--model <model>] [--role <role>] [--timeout <ms>]", "error");
           return;
         }
-        const result = await runOneShot(parsed.prompt, parsed.name ?? `pi-${Date.now().toString(36)}`, parsed.model, parsed.timeout, ctx.cwd);
+        const result = await runOneShot(parsed, ctx, ctx.cwd);
         notify(ctx, result, result.startsWith("Failed") ? "error" : "info");
       } catch (error: any) {
         notify(ctx, error.message, "error");
@@ -734,15 +1313,15 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("spawnp", {
-    description: "Quick spawn with an auto-generated name: /spawnp <prompt> [--model <model>]",
+    description: "Quick spawn with an auto-generated name: /spawnp <prompt> [--model <model>] [--role <role>]",
     handler: async (args, ctx) => {
       try {
         const parsed = parseSpawnArgs(args);
         if (!parsed.prompt) {
-          notify(ctx, "Usage: /spawnp <prompt> [--model <model>]", "error");
+          notify(ctx, "Usage: /spawnp <prompt> [--model <model>] [--role <role>]", "error");
           return;
         }
-        notify(ctx, await runOneShot(parsed.prompt, `pi-${Date.now().toString(36)}`, parsed.model, parsed.timeout, ctx.cwd));
+        notify(ctx, await runOneShot(parsed, ctx, ctx.cwd));
       } catch (error: any) {
         notify(ctx, error.message, "error");
       }
@@ -754,9 +1333,14 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       if (process.env.HERDR_ENV !== "1") return notify(ctx, "Not running in Herdr environment.", "error");
       try {
-        const parsed = parseJson<{ result?: { agents?: Array<{ name: string; agent_status: string; pane_id: string }> } }>(runHerdr(["agent", "list"]));
-        const agents = parsed.result?.agents ?? [];
-        notify(ctx, agents.length ? agents.map((agent) => `- ${agent.name} (${agent.agent_status}) in ${agent.pane_id}`).join("\n") : "No agents currently running.");
+        const parsed = parseJson<{ result?: { agents?: HerdrAgent[] } }>(runHerdr(["agent", "list"]));
+        const agents = (parsed.result?.agents ?? []).filter((agent) => agent.agent === "pi");
+        notify(
+          ctx,
+          agents.length
+            ? agents.map((agent) => `- ${agent.name} (${agent.agent_status}) in ${agent.pane_id}`).join("\n")
+            : "No agents currently running.",
+        );
       } catch (error: any) {
         notify(ctx, `Failed: ${error.message}`, "error");
       }
@@ -769,11 +1353,13 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       const name = args.trim();
       if (!name) return notify(ctx, "Usage: /spawnkill <agent-name>", "error");
       try {
-        const parsed = parseJson<{ result?: { agent?: { pane_id?: string } } }>(runHerdr(["agent", "get", name]));
+        const parsed = parseJson<{ result?: { agent?: { pane_id?: string; tab_id?: string } } }>(
+          runHerdr(["agent", "get", name]),
+        );
         const paneId = parsed.result?.agent?.pane_id;
-        if (!paneId) throw new Error(`Agent not found: ${name}`);
-        closeWorker({ name, paneId });
-        if (worker?.name === name) worker = undefined;
+        const tabId = parsed.result?.agent?.tab_id;
+        if (!paneId && !tabId) throw new Error(`Agent not found: ${name}`);
+        closeTab({ tabId, paneId });
         notify(ctx, `Killed agent ${name}.`);
       } catch (error: any) {
         notify(ctx, `Failed: ${error.message}`, "error");
@@ -784,65 +1370,35 @@ export default function herdrSpawn(pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_pi",
     label: "Spawn Pi",
-    description: "Spawn a temporary pi agent in a new Herdr pane, wait for its response, then clean it up.",
+    description:
+      "Spawn a temporary pi agent in a new Herdr pane, wait for its response, then clean it up. Optionally pass role (a .pi/agents/<role>.md name) to give it a custom system prompt.",
     parameters: Type.Object({
       prompt: Type.String({ description: "The prompt to send" }),
       name: Type.Optional(Type.String()),
       model: Type.Optional(Type.String()),
+      role: Type.Optional(
+        Type.String({ description: "Role name from .pi/agents/<role>.md; supplies the system prompt (and optionally model/thinking/tools)" }),
+      ),
       timeout: Type.Optional(Type.Number()),
       direction: Type.Optional(Type.Union([Type.Literal("right"), Type.Literal("down")])),
     }),
     async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
-      const value = input as { prompt: string; name?: string; model?: string; timeout?: number; direction?: "right" | "down" };
+      const value = input as {
+        prompt: string;
+        name?: string;
+        model?: string;
+        role?: string;
+        timeout?: number;
+        direction?: "right" | "down";
+      };
       const name = value.name || `pi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-      const response = await runOneShot(value.prompt, name, value.model, value.timeout ?? 120000, ctx.cwd, value.direction ?? "right");
+      const response = await runOneShot(
+        { prompt: value.prompt, name, model: value.model, role: value.role, timeout: value.timeout ?? 120000 },
+        ctx,
+        ctx.cwd,
+        value.direction ?? "right",
+      );
       return { content: [{ type: "text", text: response }], details: { agent_name: name } };
     },
   });
-}
-
-function parseSpawnArgs(args: string): { prompt: string; name?: string; model?: string; timeout: number } {
-  const tokens = args.trim().split(/\s+/).filter(Boolean);
-  const promptTokens: string[] = [];
-  let name: string | undefined;
-  let model: string | undefined;
-  let timeout = 120000;
-
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index]!;
-    if (token === "--name" || token === "--model" || token === "--timeout") {
-      const value = tokens[++index];
-      if (!value) throw new Error(`${token} requires a value`);
-      if (token === "--name") name = value;
-      else if (token === "--model") model = value;
-      else timeout = Number(value);
-    } else {
-      promptTokens.push(token);
-    }
-  }
-
-  if (!Number.isFinite(timeout) || timeout <= 0) throw new Error("--timeout must be a positive number");
-  return { prompt: promptTokens.join(" "), name, model, timeout };
-}
-
-async function runOneShot(prompt: string, name: string, model: string | undefined, timeout: number, cwd: string, direction = "right"): Promise<string> {
-  if (process.env.HERDR_ENV !== "1") return "Failed: Not running in Herdr environment. Cannot spawn pane.";
-  let paneId: string | undefined;
-  try {
-    const split = parseJson<{ result?: { pane?: { pane_id?: string } } }>(runHerdr(["pane", "split", "--current", "--direction", direction, "--cwd", cwd, "--no-focus"]));
-    paneId = split.result?.pane?.pane_id;
-    if (!paneId) throw new Error("Could not create new pane");
-    const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--"];
-    if (model) startArgs.push("--model", model);
-    await waitForShell(startArgs, paneId);
-    runHerdr(["agent", "prompt", name, prompt, "--wait", "--timeout", String(timeout)], timeout + 30000);
-    const response = runHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "100"]);
-    return `Agent ${name} completed in pane ${paneId}\n\n${response}`;
-  } catch (error: any) {
-    return `Failed: ${error.message}`;
-  } finally {
-    if (paneId) {
-      try { runHerdr(["pane", "close", paneId]); } catch { /* best effort cleanup */ }
-    }
-  }
 }
