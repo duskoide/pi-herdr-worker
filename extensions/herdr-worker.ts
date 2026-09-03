@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
@@ -280,20 +280,16 @@ function roleSystemPrompt(role: RoleDef): string {
 // Herdr plumbing
 // ---------------------------------------------------------------------------
 
-function runHerdr(args: string[], timeout = 30000): string {
-  return execFileSync("herdr", args, {
-    encoding: "utf8",
-    timeout,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-}
-
-function runHerdrAsync(args: string[], timeout = 30000): Promise<string> {
+// All herdr calls are async (execFile) so they never block pi's event loop.
+// Using execFileSync here would freeze the whole session while a subagent is
+// created, started, or waited on — the extension runs in pi's single-threaded
+// loop and a long synchronous child call stalls every tool and keystroke.
+function runHerdr(args: string[], timeout = 30000): Promise<string> {
   return new Promise((resolveOutput, reject) => {
     execFile(
       "herdr",
       args,
-      { encoding: "utf8", timeout, maxBuffer: 10 * 1024 * 1024 },
+      { encoding: "utf8", timeout, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
       (error, stdout) => {
         if (error) reject(error);
         else resolveOutput(stdout);
@@ -310,7 +306,7 @@ const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 async function waitForShell(startArgs: string[], paneId: string, attempts = 25, delayMs = 200): Promise<void> {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      runHerdr(startArgs);
+      await runHerdr(startArgs);
       return;
     } catch (error: any) {
       const message = error.message ?? "";
@@ -336,10 +332,10 @@ function spawnName(roleName: string): string {
   return `pi-worker-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}-${slugRole(roleName)}`.slice(0, 31);
 }
 
-function closeTab(record: Pick<ActiveDelegation, "tabId" | "paneId">) {
+async function closeTab(record: { tabId?: string; paneId?: string }) {
   try {
-    if (record.tabId) runHerdr(["tab", "close", record.tabId]);
-    else if (record.paneId) runHerdr(["pane", "close", record.paneId]);
+    if (record.tabId) await runHerdr(["tab", "close", record.tabId]);
+    else if (record.paneId) await runHerdr(["pane", "close", record.paneId]);
   } catch {
     // The tab or pane may already have been closed by Herdr or the user.
   }
@@ -523,7 +519,7 @@ async function runDelegation(record: ActiveDelegation) {
 
     const created = parseJson<{
       result?: { tab?: { tab_id?: string }; root_pane?: { pane_id?: string } };
-    }>(runHerdr(["tab", "create", "--cwd", ctx.cwd, "--label", record.name, "--no-focus"]));
+    }>(await runHerdr(["tab", "create", "--cwd", ctx.cwd, "--label", record.name, "--no-focus"]));
     record.tabId = created.result?.tab?.tab_id;
     record.paneId = created.result?.root_pane?.pane_id;
     if (!record.tabId || !record.paneId) throw new Error("Could not create a Herdr subagent tab.");
@@ -534,11 +530,11 @@ async function runDelegation(record: ActiveDelegation) {
     await waitForShell(startArgs, record.paneId);
 
     const timeout = job.args.timeout ?? DEFAULT_WORKER_TIMEOUT;
-    await runHerdrAsync(
+    await runHerdr(
       ["agent", "prompt", record.name, job.args.prompt, "--wait", "--timeout", String(timeout)],
       timeout + 30000,
     );
-    const report = await runHerdrAsync([
+    const report = await runHerdr([
       "agent",
       "read",
       record.name,
@@ -553,7 +549,7 @@ async function runDelegation(record: ActiveDelegation) {
   } finally {
     // Close the tab on every path — including a mid-flight mode switch or
     // session reload — so no Herdr tab is ever leaked.
-    closeTab(record);
+    await closeTab(record);
     const index = state.activeDelegations.indexOf(record);
     if (index >= 0) state.activeDelegations.splice(index, 1);
     refreshStatus();
@@ -1086,7 +1082,7 @@ async function runOneShot(parsed: OneShotArgs, ctx: ExtensionContext | undefined
   let paneId: string | undefined;
   try {
     const split = parseJson<{ result?: { pane?: { pane_id?: string } } }>(
-      runHerdr(["pane", "split", "--current", "--direction", direction, "--cwd", cwd, "--no-focus"]),
+      await runHerdr(["pane", "split", "--current", "--direction", direction, "--cwd", cwd, "--no-focus"]),
     );
     paneId = split.result?.pane?.pane_id;
     if (!paneId) throw new Error("Could not create new pane");
@@ -1098,15 +1094,18 @@ async function runOneShot(parsed: OneShotArgs, ctx: ExtensionContext | undefined
       if (parsed.thinking) startArgs.push("--thinking", parsed.thinking);
     }
     await waitForShell(startArgs, paneId);
-    runHerdr(["agent", "prompt", name, parsed.prompt, "--wait", "--timeout", String(parsed.timeout)], parsed.timeout + 30000);
-    const response = runHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "100"]);
+    await runHerdr(
+      ["agent", "prompt", name, parsed.prompt, "--wait", "--timeout", String(parsed.timeout)],
+      parsed.timeout + 30000,
+    );
+    const response = await runHerdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "100"]);
     return `Agent ${name} completed in pane ${paneId}\n\n${response}`;
   } catch (error: any) {
     return `Failed: ${error.message}`;
   } finally {
     if (paneId) {
       try {
-        runHerdr(["pane", "close", paneId]);
+        await runHerdr(["pane", "close", paneId]);
       } catch {
         // best effort cleanup
       }
@@ -1152,7 +1151,15 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     }
     // Owned subagent tabs are closed with the session. runDelegation's finally
     // closes them too, so these calls are best-effort duplicates.
-    for (const record of state.activeDelegations) closeTab(record);
+    await Promise.all(
+      state.activeDelegations.map(async (record) => {
+        try {
+          await closeTab(record);
+        } catch {
+          // best effort on shutdown
+        }
+      }),
+    );
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -1333,7 +1340,7 @@ export default function herdrSpawn(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       if (process.env.HERDR_ENV !== "1") return notify(ctx, "Not running in Herdr environment.", "error");
       try {
-        const parsed = parseJson<{ result?: { agents?: HerdrAgent[] } }>(runHerdr(["agent", "list"]));
+        const parsed = parseJson<{ result?: { agents?: HerdrAgent[] } }>(await runHerdr(["agent", "list"]));
         const agents = (parsed.result?.agents ?? []).filter((agent) => agent.agent === "pi");
         notify(
           ctx,
@@ -1354,12 +1361,12 @@ export default function herdrSpawn(pi: ExtensionAPI) {
       if (!name) return notify(ctx, "Usage: /spawnkill <agent-name>", "error");
       try {
         const parsed = parseJson<{ result?: { agent?: { pane_id?: string; tab_id?: string } } }>(
-          runHerdr(["agent", "get", name]),
+          await runHerdr(["agent", "get", name]),
         );
         const paneId = parsed.result?.agent?.pane_id;
         const tabId = parsed.result?.agent?.tab_id;
         if (!paneId && !tabId) throw new Error(`Agent not found: ${name}`);
-        closeTab({ tabId, paneId });
+        await closeTab({ tabId, paneId });
         notify(ctx, `Killed agent ${name}.`);
       } catch (error: any) {
         notify(ctx, `Failed: ${error.message}`, "error");
