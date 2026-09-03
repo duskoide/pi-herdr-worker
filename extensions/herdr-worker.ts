@@ -313,18 +313,25 @@ async function waitForShell(startArgs: string[], paneId: string, attempts = 25, 
   throw new Error(`Herdr pane ${paneId} never became an available shell.`);
 }
 
-// Submit a prompt and wait for the agent to settle. Herdr's `agent prompt --wait`
-// has a hard 5-second gate that fires whenever the agent starts from a
-// non-working state and demands an observed state change inside that window;
-// if the subagent's first turn takes longer than 5s (common for cold-start
-// model calls), the gate rejects with agent_prompt_stalled even though the
-// subagent is doing exactly what was asked. Splitting submission from waiting
-// sidesteps the gate: the unconditional `agent wait --until ...` does not have
+// Submit a prompt and wait for the agent to settle.
+//
+// Herdr's `agent prompt --wait` has a hard 5-second gate that fires whenever
+// the agent starts from a non-working state and demands an observed state
+// change inside that window; cold-start model calls routinely exceed 5s, so
+// the gate rejects the delegation with agent_prompt_stalled even though the
+// subagent is doing exactly what was asked. Decoupling submission from
+// waiting sidesteps the gate: the unconditional `agent wait` does not have
 // it.
+//
+// We wait for `done` (turn finished, ready for the next input) or `blocked`
+// (turn needs interactive input we cannot satisfy from a delegation). Matching
+// `idle` would match the initial state too and turn the wait into a no-op,
+// which is why this used to return the subagent's pane before the assistant
+// had started producing output.
 async function submitAndAwaitAgent(name: string, prompt: string, timeoutMs: number): Promise<void> {
   await runHerdr(["agent", "prompt", name, prompt]);
   await runHerdr(
-    ["agent", "wait", name, "--until", "idle", "--until", "done", "--until", "blocked", "--timeout", String(timeoutMs)],
+    ["agent", "wait", name, "--until", "done", "--until", "blocked", "--timeout", String(timeoutMs)],
     timeoutMs + 30000,
   );
 }
